@@ -1,0 +1,48 @@
+# Model weights (~15 GB) - too large for git
+weights/
+
+# Generated/experimental data (~5 GB outputs, ~370 MB data)
+data/
+outputs/
+
+# Project documentation (internal planning/logs)
+agents.md
+backlog_quantization.md
+resultados_bloques.md
+datasetmozilla.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*$py.class
+
+# HuggingFace cache
+.cache/
+
+# Temporary diagnostic scripts
+_check_deps.*
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs and checkpoints
+*.log
+checkpoints/
+wandb/

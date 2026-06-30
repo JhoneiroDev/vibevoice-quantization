@@ -1,4 +1,4 @@
-### Tablero de Control y Backlog: Objetivos Específicos 2 al 5 (Cuantización y Benchmark VibeVoice)
+### Tablero de Control y Backlog: Cuantización y Benchmark VibeVoice
 Este documento registra la planificación por Sprints, el estado de las tareas y la asignación técnica para alcanzar el hito central de la investigación: la optimización multi-técnica post-entrenamiento (PTQ) de la arquitectura VibeVoice 1.5B, preparando los modelos en hardware local (RTX 4060 Ti) para su posterior benchmark en servidores limitados.
 
 --------------------------------------------------------------------------------
@@ -8,81 +8,163 @@ Este documento registra la planificación por Sprints, el estado de las tareas y
 | ------ | ------ | ------ | ------ |
 | **Sprint 1** | Ingesta de Datos, Partición y Set de Calibración | COMPLETADO | 100% |
 | **Sprint 1.5** | Fine-Tuning Monolingüe Español (LoRA + Diffusion Head) | COMPLETADO | 100% |
-| **Sprint 2** | Línea Base FP16 ($O_1$) y Baseline Ingenuo (RTN 4-bits) | COMPLETADO | 100% |
-| **Sprint 2.5** | Analisis de Arquitectura y Diagnostico de Fallos | COMPLETADO | 100% |
-| **Sprint 3** | Baseline Avanzado: GPTQ 4-bits (VibeVoice COMPLETO) | COMPLETADO | 100% |
-| **Sprint 4** | Enfoque Propuesto: Híbrido AWQ (4-bits) + Compensación LoRA | POR EMPEZAR | 0% |
-| **Sprint 5** | Benchmark en Servidor Limitado y Validación Estadística | POR EMPEZAR | 0% |
+| **Sprint 2** | RTN-INT4 via bitsandbytes (split layout) | IMPLEMENTADO | 100% |
+| **Sprint 3** | GPTQ-INT4 via GPTQModel (qforge, split layout) | IMPLEMENTADO | 100% |
+| **Sprint 4** | AWQ-INT4 Marlin (qforge) + LoRA compensacion | IMPLEMENTADO | 100% |
+| **Sprint 5** | INT8 via bitsandbytes (split layout) | IMPLEMENTADO | 100% |
+| **Sprint 6** | NF4 + Double Quant via bitsandbytes (split layout) | IMPLEMENTADO | 100% |
+| **Sprint 7** | FP8 E4M3FN via torch nativo (split layout) | IMPLEMENTADO | 100% |
+| **Sprint 8** | 🏁 Benchmark Final: 7 Modelos + Validación Estadística | IMPLEMENTADO | 100% |
+
+--------------------------------------------------------------------------------
+
+### 🏗️ Entornos de Ejecución
+
+| Entorno | transformers | Propósito | Sprints |
+|---------|-------------|-----------|---------|
+| `vibevoice` | 4.51.3 | VibeVoice inference, extraccion, reinsercion, bnb, FP8, benchmark | 2, 5, 6, 7, 8 |
+| `qforge` | >=5.4.0 | GPTQModel + autoawq (cuantizacion del Qwen2 standalone) | 3, 4 |
+
+```bash
+# Setup unico para qforge:
+micromamba create -n qforge python=3.12 -y
+micromamba run -n qforge pip install gptqmodel autoawq datasets
+```
+
+Los entornos se comunican exclusivamente via archivos: `weights/standalone_qwen_fp16/`.
+
+--------------------------------------------------------------------------------
+
+### 🧱 Fase Transversal A: Extraccion del Qwen2 (compartida por todos los sprints)
+
+Ejecutar UNA SOLA VEZ antes de cualquier sprint:
+- Carga VibeVoice-ES con `VibeVoiceForConditionalGeneration`
+- Extrae `model.model.language_model` (Qwen2Model)
+- Crea `Qwen2ForCausalLM` con `lm_head = embed_tokens` (tied)
+- Guarda como checkpoint standalone en `weights/standalone_qwen_fp16/`
+- Guarda tokenizer para calibracion de texto
+- Celda: `fase-a-extract` en el notebook
+
+### 🧱 Fase Transversal B: Split Layout (por sprint)
+
+Para cada tecnica, en `vibevoice`:
+1. Crear `weights/vibevoice-1.5b-es-{tecnica}/`
+2. Guardar pesos no-decoder (tokenizers, diffusion head, conectores) como FP16 en raiz
+3. Crear subdirectorio `decoder-{fmt}/` con pesos cuantizados + `quantization_config.json`
+4. Actualizar `config.json` raiz: `"vibevoice_decoder_model_path": "decoder-{fmt}"`
 
 --------------------------------------------------------------------------------
 
 #### 🏃‍♂️ Planificación Detallada por Sprints
-##### Sprint 1: Infraestructura de Datos y Pipeline de Calibración (Semanas 1-2) ✅
-*   **Objetivo del Sprint:** Consolidar el entorno de datos local en WSL2 y construir el cargador de tensores que alimentará a los algoritmos avanzados de cuantización offline en la RTX 4060 Ti.
-*   **Nota de Arquitectura:** VibeVoice 1.5B procesa **audio crudo monofónico a 24,000 Hz** (no espectrogramas de Mel). La arquitectura usa un autoencoder convolucional puramente temporal con factor de compresión 3200× (7.5 Hz frame rate). Ver `agents.md` sección 3 — Parámetros de Audio del Modelo.
-*   **Tareas Asignadas a OpenCode:**
-    *  [x]  **TSK-1.1:** Desarrollar el script de descarga automatizada del subconjunto en español de Common Voice 17.0 usando el mirror comunitario `fsicoli/common_voice_17_0` (config `"es"`). El dataset original de Mozilla fue retirado de HuggingFace en Oct 2025. → `notebooks/tesis_model_cuantization.ipynb` Bloque TSK-1.1
-    *  [x]  **TSK-1.2:** Implementar la lógica de partición usando los splits nativos de CV17: `train` para fine-tuning, `test` para benchmark, `validation` para calibración. → `data/dataset_partitions.json`
-    *  [x]  **TSK-1.3:** Construir el módulo de preprocesamiento acústico: remuestreo de 16kHz → 24kHz, normalización de amplitud a -25 dB FS y prevención de clipping, generando tensores `float32` compatibles con el encoder convolucional del modelo. → `notebooks/tesis_model_cuantization.ipynb` Bloque TSK-1.3
-    *  [x]  **TSK-1.4:** Agrupar 512 muestras del 10% de validación en un tensor secuencial unificado (`data/calibration_tensor.pt`) con metadatos de offsets (`data/calibration_metadata.json`) para servir como el **Set de Calibración Offline** requerido por GPTQ y AWQ. → `notebooks/tesis_model_cuantization.ipynb` Bloque TSK-1.4
+
+##### Sprint 1: Infraestructura de Datos y Pipeline de Calibración ✅
+- Dataset: `fsicoli/common_voice_17_0` (config `"es"`), mirror comunitario
+- Splits: `train` (fine-tuning), `validation` (calibracion), `test` (benchmark)
+- Preprocesamiento: remuestreo 48kHz→24kHz, normalizacion -25 dB FS
+- Output: `data/calibration_tensor.pt` (512 clips, 285 MB) + `data/calibration_metadata.json`
+
+##### Sprint 1.5: Fine-Tuning Monolingüe Español con LoRA ✅
+- LoRA rank=8 sobre Q/K/V/O/gate/up/down del LLM + diffusion head
+- 18.6h, 5263 pasos, 1 epoch. CE loss: 1.93→1.72
+- Merge verificado: `weights/vibevoice-1.5b-es/` (10.3 GB, VRAM: 5.04 GB)
+
+##### Sprint 2: RTN-INT4 via bitsandbytes ✅
+- **Implementacion:** `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="fp4")` sobre Qwen2 standalone
+- **Split layout:** `decoder-rtn/` con pesos FP16 dequantizados
+- **Sin calibracion.** Baseline automatico de la industria
+- Celda: `s2-rtn-bnb`
+
+##### Sprint 3: GPTQ-INT4 via GPTQModel (qforge) ✅
+- **Implementacion:** `GPTQModel.from_pretrained()` + `model.quantize(calib_data)` en qforge
+- **Calibracion:** 256 chunks concatenados de CV17 (~512 tokens avg)
+- **Config:** bits=4, group_size=128, sym=True, damp_percent=0.1 (>=0.1 para LoRA), desc_act=False
+- **Split layout:** `decoder-gptq/` con INT4 empaquetado real (kernels CUDA)
+- Celda: `s3-gptqmodel`
+
+##### Sprint 4: AWQ-INT4 Marlin (qforge) + LoRA (vibevoice) ✅
+- **Parte A (qforge):** `AutoAWQForCausalLM.from_pretrained()` + `model.quantize(tokenizer, quant_config={"zero_point":True, "q_group_size":128, "w_bit":4, "version":"Marlin"})`
+- **Calibracion:** 256 prompts hibridos narracion+dialogo multi-hablante
+- **Split layout:** `decoder-awq/` con kernels Marlin para Ada Lovelace
+- **Parte B (vibevoice):** LoRA rank=8 via PEFT sobre q_proj/v_proj. Fine-tuning 200 pasos con 10K muestras CV17. `merge_and_unload()`
+- Celdas: `s4-awq-marlin`, `s4-lora`
+
+##### Sprint 5: INT8 Selectivo via bitsandbytes (Fabio Sarracino + HelpfulHand3) ✅
+- **Implementacion:** `BitsAndBytesConfig(load_in_8bit=True)` sobre Qwen2 standalone. Equivalente a `llm_int8_skip_modules=["diffusion_head","acoustic_connector","semantic_connector","audio_encoder","lm_head"]` de Fabio pero via split layout (los modulos de audio nunca se tocan — vienen de FP16 original).
+- **Split layout:** `decoder-int8/` con state_dict FP16 dequantizado
+- **Hallazgo HelpfulHand3:** Tokenizers DEBEN permanecer en FP16 (inestabilidad acustica, alucinacion de ruido)
+- **Hipotesis:** INT8 preserva calidad (WER ≈ FP16) con compresion ~2x
+- Celda: `s5-int8`
+
+##### Sprint 6: NF4 + Double Quant via bitsandbytes ✅
+- **Implementacion:** `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16)`
+- **Exclusion:** `embed_tokens` excluido del state_dict (protege identidad vocal)
+- **Hallazgo Soniqo:** NF4 preserva prosodia >30s. Double quant comprime escalas (~6GB→~4GB VRAM)
+- Celda: `s6-nf4`
+
+##### Sprint 7: FP8 E4M3FN via torch nativo ✅
+- **Implementacion:** `.to(torch.float8_e4m3fn)` sobre nn.Linear del Qwen2
+- **Proteccion:** Si `W.abs().max() > 448`, aplicar scaling simetrico antes del casteo
+- **Hallazgo CyberVoice Labs:** FP8 elimina "voz metalica" del DPM-Solver (mantisa+exponente)
+- **Ventaja:** Tensor Cores Ada Lovelace 4ta Gen, sin calibracion, ~2.7 GB disco
+- Celda: `s7-fp8`
+
+##### Sprint 8: 🏁 Benchmark Final — 7 Modelos + Validación Estadística
+- **Modelos:** FP16, RTN, GPTQ, AWQ+LoRA, INT8, NF4, FP8
+- **Dataset:** 200 muestras aleatorias del split `test` de CV17
+- **Metricas:** VRAM reposo/pico, RTF, WER/CER (Whisper large-v3), PESQ, MCD, espacio en disco
+- **Estadistica:** Shapiro-Wilk (normalidad) + Wilcoxon signed-rank (muestras pareadas, p < 0.01)
+- **Output:** `outputs/sprint8/metrics_benchmark_report.json`, graficos seaborn, tabla LaTeX booktabs
+- Celda: `s8-bench` (placeholder, se completa al tener los 7 modelos)
 
 --------------------------------------------------------------------------------
 
-##### Sprint 1.5: Fine-Tuning Monolingüe Español con LoRA (Semanas 2-3) ✅
-*   **Objetivo del Sprint:** Adaptar VibeVoice 1.5B a español exclusivamente mediante fine-tuning eficiente con LoRA sobre el dataset `fsicoli/common_voice_17_0` (config `"es"`, split `train`). El modelo resultante (**VibeVoice-ES**) será la nueva línea base FP16 sobre la cual se aplicarán todas las técnicas de cuantización en los Sprints 2-4. La especialización monolingüe ocurre por *catastrophic forgetting* natural de los otros idiomas al entrenar exclusivamente con datos en español.
-*   **Resultado:** Entrenamiento completado (18.6h, 5263 pasos, 1 epoch). CE loss: 1.93→1.72. Merge verificado: LLM LoRA + diffusion head (22/26 params) fusionados correctamente en `weights/vibevoice-1.5b-es/` (10.3 GB, VRAM reposo: 5.04 GB).
-*   **Tareas Asignadas a OpenCode:**
-    *  [x]  **TSK-1.5.1:** Formatear el dataset CV17 al esquema VibeVoice: 336,846 registros en `data/finetune/cv17_es_train.jsonl` (85 MB). → `notebooks/tesis_model_cuantization.ipynb`
-    *  [x]  **TSK-1.5.2:** Configurar y ejecutar fine-tuning con `train_vibevoice.py`. 18.6h en RTX 4060 Ti. Checkpoint en `outputs/finetune_vibevoice_es/`. → `scripts/run_finetune_es.sh`
-    *  [x]  **TSK-1.5.3:** Merge de LoRA + diffusion head → **VibeVoice-ES** en `weights/vibevoice-1.5b-es/`. Verificación: 26/26 parámetros correctos. → `scripts/merge_es_checkpoint.sh`
-    *  [x]  **TSK-1.5.4:** Validación: VRAM reposo 5.04 GB, tamaño disco 10.3 GB. Margen suficiente para cuantización. → `notebooks/tesis_model_cuantization.ipynb`
+### 📂 Estructura de Pesos Esperada
+
+```
+weights/
+├── vibevoice-1.5b/                  # VibeVoice original (base)
+├── vibevoice-1.5b-es/               # VibeVoice-ES (fine-tuneado, baseline FP16)
+├── standalone_qwen_fp16/             # Qwen2 extraido (Fase A, compartido)
+├── vibevoice-1.5b-es-rtn/           # Sprint 2
+│   ├── non_decoder_weights.pt
+│   ├── config.json (vibevoice_decoder_model_path="decoder-rtn")
+│   └── decoder-rtn/
+├── vibevoice-1.5b-es-gptq/          # Sprint 3
+│   └── decoder-gptq/
+├── vibevoice-1.5b-es-awq/           # Sprint 4 (AWQ solo)
+│   └── decoder-awq/
+├── vibevoice-1.5b-es-awq-lora/      # Sprint 4 (AWQ+LoRA)
+├── vibevoice-1.5b-es-int8/          # Sprint 5
+│   └── decoder-int8/
+├── vibevoice-1.5b-es-nf4/           # Sprint 6
+│   └── decoder-nf4/
+└── vibevoice-1.5b-es-fp8/           # Sprint 7
+    └── decoder-fp8/
+```
 
 --------------------------------------------------------------------------------
 
-##### Sprint 2: Línea Base FP16 ($O_1$) y Baseline Ingenuo (RTN 4-bits) ✅
-*   **Objetivo del Sprint:** Documentar métricas de VibeVoice-ES sin compresión y ejecutar cuantización RTN como baseline comparativa.
-*   **Resultados:** RTF=1.35 (FP16) / 1.48 (RTN), WER=0.54 / 0.38, CER=0.31 / 0.15. VRAM RTN: +38% (6.97 GB) por buffers FP16 no fusionados de bnb.
-*   **Leccion (Directriz 5):** bitsandbytes no fusiona dequantizacion en kernel. Overhead de VRAM lo hace inadecuado para despliegue en 8GB. Util solo como baseline.
+### 📋 Hallazgos de Arquitectura
+
+- **Split Layout (lemuriandezapada, ComfyUI-VibeVoice):** Cuantizar solo Qwen2 como checkpoint standalone, preservar audio modules en FP16. `vibevoice_decoder_model_path` en config.json permite carga nativa.
+- **Conv1D → F16/F32 obligatorio (Mudler):** Si se cuantizan capas Conv1D de tokenizers, el casting inline corrompe las salidas de convolucion acustica.
+- **AdaLN fragil bajo INT4 (FluffyBunnies):** Los bloques Adaptive Layer Normalization del diffusion head fallan bajo ciertos esquemas INT4. Mantener prediction_head en FP16.
+- **NF4 > RTN para hablantes (DevParker):** NF4 preserva mejor la diarizacion de hablantes que RTN. La distribucion normal se adapta mejor a pesos del LLM congelado.
+- **FP8 elimina voz metalica (CyberVoice Labs):** Las tecnicas INT destruyen suavidad del DPM-Solver. FP8 con mantisa+exponente elimina saltos abruptos.
+- **embed_tokens excluido (Soniqo):** El multiplicador de escala simetrica en proyecciones de atencion es clave para proteger identidad de voz.
+- **lm_head tied con embed_tokens (Directriz 10):** `tie_word_embeddings=True` en Qwen2.5-1.5B. Comparten memoria fisica. NO cuantizar lm_head.
+- **Tecnicas NO viables:** GGUF (requiere binarios C++ externos), MLX (Apple Silicon exclusivo), ONNX INT4 (AdaLN blocks fallan).
 
 --------------------------------------------------------------------------------
 
-##### Sprint 3: Optimización por Hessiana de Segundo Orden (GPTQ) ✅
-*   **Resultado final:** 220/222 capas cuantizadas (26 min). GPTQ manual PyTorch puro.
-*   **Métricas:** VRAM=6.18 GB, RTF=1.23, WER=0.2746 (multi-sample), CER=0.1774, PPL=12.76 (Clase-3).
-*   **Comparativa:** WER mejoro 0.54→0.27 vs FP16. RTF similar (1.23 vs 1.35). VRAM aumento +22% por falta de empaquetado INT4 nativo.
-*   **Lecciones:** forward_speech_features con "audio" tiene bug encode()[0][0]; usar "vae" con pre-encoding. Calibracion audio+texto con semantic features reales. damp=0.1 requerido por LoRA.
-
---------------------------------------------------------------------------------
-
-##### Sprint 4: Enfoque Propuesto - Híbrido AWQ + Compensación LoRA (Semanas 7-8)
-*   **Objetivo del Sprint:** Aplicar AWQ sobre VibeVoice-ES COMPLETO (misma estrategia que GPTQ: modelo integrado, calibracion audio+texto, excluir Conv1d) + LoRA de compensacion post-cuantizacion.
-*   **Estrategia:** Seguir Fase B del plan de accion en `docs/quantization_architecture_analysis.md`
-*   **Tareas Asignadas a OpenCode:**
-    *  [ ]  **TSK-4.1:** Instalar y validar la librería `autoawq` interactuando con los núcleos CUDA Ada Lovelace nativos del sistema.
-    *  [ ]  **TSK-4.2:** Desarrollar el pipeline de inspección offline que analice la magnitud de las activaciones para aislar los canales de peso salientes.
-    *  [ ]  **TSK-4.3:** Aplicar la transformación equivalente y ejecutar compresión a **INT4 (g128)**.
-    *  [ ]  **TSK-4.4:** **[IMPLEMENTACIÓN HÍBRIDA]** Desarrollar el mecanismo de adaptación de bajo rango (LoRA / Style Decorator). Cargar el modelo AWQ congelado y aplicar factorizaciones a las capas atencionales para compensar el error de cuantización.
-    *  [ ]  **TSK-4.5:** Correr el módulo evaluador de calidad fonética (librería JiWER) y guardar el checkpoint optimizado final.
-
---------------------------------------------------------------------------------
-
-##### Sprint 5: Consolidación, Benchmark en Servidor y Reporte Estadístico ($O_2$) (Semanas 9-10)
-*   **Objetivo del Sprint:** Desplegar los 4 modelos derivados de VibeVoice-ES (FP16, RTN, GPTQ, AWQ+LoRA) en un entorno de servidor limitado, unificar métricas y aplicar pruebas de significancia para el Capítulo 6 del manuscrito.
-*   **Tareas Asignadas a OpenCode:**
-    *  [ ]  **TSK-5.1:** Escribir y ejecutar el script de inferencia automatizada ("Arena de Pruebas") en el servidor limitado, forzando a los 4 modelos a sintetizar el set de pruebas en español (20% partición `test_indices`).
-    *  [ ]  **TSK-5.2:** Utilizar *profilers* (como `psutil`) en el servidor para compilar los logs históricos de inferencia (Latencia, huella de RAM/VRAM, % CPU) en un archivo `metrics_benchmark_report.json`.
-    *  [ ]  **TSK-5.3:** Generar la tabla comparativa final y utilizar matplotlib / seaborn para trazar gráficos de dispersión que expongan el *trade-off* entre la velocidad (RTF) y el error lingüístico (WER/CER/PESQ).
-    *  [ ]  **TSK-5.4:** **[VALIDACIÓN]** Desarrollar el script estadístico con `scipy.stats`. Aplicar la prueba de normalidad de **Shapiro-Wilk** y la prueba no paramétrica de **Wilcoxon para muestras pareadas** para respaldar la aceptación de la hipótesis ($H_1$) de superioridad del modelo propuesto.
-
---------------------------------------------------------------------------------
-
-#### 🛠️ Directrices Técnicas para la Ejecución de Tareas
-1.  **Defensa de Memoria Local:** Cada tarea que implique cuantización en frío (GPTQ/AWQ) debe precederse obligatoriamente por una limpieza explícita de caché mediante `torch.cuda.empty_cache()` para evitar desbordamientos en la RTX 4060 Ti de 8GB.
-2.  **Entorno Separado para Benchmark:** La creación de los modelos se realiza en WSL2 / RTX 4060 Ti. La recolección de métricas del Sprint 5 debe ser ejecutada simulando o usando las restricciones del servidor de inferencia.
-3.  **Preservación de Estructuras:** Ningún script generado por OpenCode puede modificar de manera directa los archivos fuente alojados en `VibeVoice_repo/`. Las alteraciones de comportamiento deben inyectarse mediante scripts de inicialización o herencia de clases desde la carpeta `scripts/`.
-4.  **Dos LoRAs, dos propósitos distintos:** El proyecto utiliza LoRA en dos momentos independientes que no deben confundirse: (a) **Sprint 1.5 — LoRA de adaptación lingüística:** fine-tuning pre-cuantización sobre datos en español para especializar el modelo; sus pesos se mergean al modelo base. (b) **Sprint 4 — LoRA de compensación:** adaptador post-cuantización AWQ para recuperar error acústico; opera sobre el modelo ya comprimido y congelado.
-5.  **SIEMPRE cuantizar VibeVoice completo**, nunca componentes aislados. Ver `docs/quantization_architecture_analysis.md` Directrices 1-8.
-6.  **Calibracion con audio real** para GPTQ/AWQ: usar `data/calibration_tensor.pt` + `data/calibration_metadata.json` con training forward (no inference generate).
-7.  **damp_percent >= 0.1** para cualquier GPTQ sobre modelo con adaptacion LoRA.
-8.  **Excluir Conv1d** de tokenizers acustico/semantico durante cuantizacion.
-9.  **bitsandbytes solo para baseline comparativa** — no usar para despliegue en 8GB por overhead de VRAM.
+#### 🛠️ Directrices Tecnicas para la Ejecucion de Tareas
+1.  **Defensa de Memoria Local:** `torch.cuda.empty_cache()` antes y despues de cada cuantizacion en frio.
+2.  **Dos entornos, dos propositos:** `vibevoice` (transformers 4.51.3) para VibeVoice y benchmark. `qforge` (transformers>=5.4.0) para GPTQModel y autoawq. Se comunican via archivos.
+3.  **Preservacion de Estructuras:** No modificar archivos fuente de `VibeVoice_repo/`. Inyectar comportamiento via scripts o herencia.
+4.  **Dos LoRAs, dos propositos distintos:** (a) Sprint 1.5 — adaptacion linguistica pre-cuantizacion (mergeada). (b) Sprint 4 — compensacion post-cuantizacion (no mergeada, opera sobre modelo congelado).
+5.  **Split Layout como estandar:** Extraer Qwen2 → cuantizar con libreria oficial → reinsertar en VibeVoice via split layout. NUNCA cuantizar el modelo completo de una sola pasada.
+6.  **NO cuantizar lm_head** — `tie_word_embeddings=True`. `lm_head.weight` comparte memoria con `embed_tokens.weight`. Excluir en todos los sprints.
+7.  **Excluir Conv1d** de tokenizers acustico/semantico durante cuantizacion.
+8.  **Calibracion con datos reales** para GPTQ/AWQ: CV17 texto o audio+texto segun la libreria lo requiera.
+9.  **bitsandbytes como herramienta valida:** INT8 y NF4 con double quant son tecnicas de produccion. Solo FP4 simple (RTN) tiene overhead problematico.
+10. **Benchmark con rigor estadistico:** Minimo 200 muestras. Shapiro-Wilk + Wilcoxon. Graficos + tabla LaTeX para el manuscrito.

@@ -18,7 +18,10 @@ Este proyecto constituye el marco experimental de una tesis que evalua tres tecn
 | **Sprint 2.5** | Analisis de arquitectura y diagnostico de fallos | Completado |
 | **Sprint 3** | GPTQ manual (INT4, g128) sobre VibeVoice completo | Completado |
 | **Sprint 4** | Hibrido AWQ (INT4) + compensacion LoRA | Pendiente |
-| **Sprint 5** | Benchmark en servidor limitado + validacion estadistica | Pendiente |
+| **Sprint 5** | INT8 selectiva (Fabio Sarracino + HelpfulHand3) | Pendiente |
+| **Sprint 6** | NF4 + double quant (DevParker/Dubedo + Soniqo) | Pendiente |
+| **Sprint 7** | FP8 E4M3FN (Zhao-Kun + CyberVoice) | Pendiente |
+| **Sprint 8** | 🏁 Benchmark: 7 modelos + validacion estadistica | Pendiente |
 
 Ver [`docs/quantization_architecture_analysis.md`](docs/quantization_architecture_analysis.md) para el analisis completo de la arquitectura, compatibilidad con GPTQ/AWQ, y diagnostico de fallos previos.
 
@@ -141,6 +144,11 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 - **Set de calibracion:** 512 muestras del split `validation`, concatenadas en `data/calibration_tensor.pt` (285 MB, `float32`), requerido por GPTQ y AWQ para recolectar estadisticas de activacion.
 - **Cuantizabilidad:** Arquitectura confirmada compatible con GPTQ/AWQ. Todas las capas proyectivas son `nn.Linear` estandar. Los tokenizers convolucionales (~35% params) se preservan en FP16. VRAM esperada post-cuantizacion: ~2.5-3.5 GB.
 - **bitsandbytes NO recomendado para despliegue:** Overhead de +38% VRAM (6.97 GB vs 5.04 GB FP16). Usar solo como baseline comparativa.
+- **Conv1D debe permanecer en FP16/FP32:** Cuantizar capas convolucionales de tokenizers corrompe las salidas acusticas (hallazgo Mudler/LocalAI). Refuerza exclusion de `acoustic_tokenizer` y `semantic_tokenizer`.
+- **AdaLN del diffusion head es fragil bajo INT4:** Los bloques Adaptive Layer Normalization fallan bajo ciertos esquemas INT4 (hallazgo FluffyBunnies/ONNX). Considerar FP16 o FP8 para diffusion head.
+- **DPM-Solver sensible a INT:** El desnatador de ruido del diffusion head genera "voz metalica" bajo cuantizacion entera. FP8 lo elimina al mantener exponentes flotantes (CyberVoice Labs).
+- **embed_tokens debe preservarse para clonacion:** Excluir `embed_tokens` en esquemas NF4 protege la identidad de voz en generaciones largas (>30s) (Soniqo).
+- **lm_head tied con embed_tokens:** En Qwen2.5-1.5B, `lm_head.weight` comparte memoria con `embed_tokens.weight`. Cuantizar `lm_head` corrompe embeddings de entrada. Excluir en GPTQ/INT8/NF4/FP8.
 
 ## Variantes de Cuantizacion (PTQ a INT4)
 
@@ -149,15 +157,22 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 | **FP16** ($O_1$) | Linea base sin compresion | — | 5.04 GB VRAM, RTF=1.35, WER=0.54 |
 | **RTN** ($X_1$) | Round-to-Nearest uniforme | bitsandbytes | 6.97 GB VRAM (+38%), RTF=1.48, WER=0.38 |
 | **GPTQ** ($X_2$) | Reconstruccion por Hessiana | PyTorch puro | 6.18 GB VRAM, RTF=1.23, WER=0.27, PPL=12.76 |
-| **AWQ+LoRA** ($X_3$) | Proteccion de canales + adaptador | autoawq + PEFT | Pendiente (Sprint 4) |
+| **AWQ+LoRA** ($X_3$) | Proteccion de canales + Marlin kernels | autoawq + PEFT | Pendiente (Sprint 4, estrategia Ncoder-ai) |
+| **INT8** | Selectiva LLM-only | bitsandbytes | Pendiente (Sprint 5) |
+| **NF4** | NormalFloat4 + double quant | bitsandbytes | Pendiente (Sprint 6) |
+| **FP8** | Punto flotante 8-bit nativo | torch.float8_e4m3fn | Pendiente (Sprint 7) |
 
-### Tabla Comparativa Final (Sprints 1-3)
+### Tabla Comparativa Final (Sprint 8 — Benchmark)
 
 | Modelo | VRAM (GB) | RTF | WER | CER | PPL |
 |--------|-----------|-----|-----|-----|-----|
 | FP16 | 5.04 | 1.35 | 0.5385 | 0.3134 | — |
 | RTN-INT4 | 6.97 | 1.48 | 0.3846 | 0.1493 | — |
 | GPTQ-INT4 | 6.18 | 1.23 | 0.2746 | 0.1774 | 12.76 |
+| AWQ+LoRA | Pendiente | Pendiente | Pendiente | Pendiente | — |
+| INT8 | Pendiente | Pendiente | Pendiente | Pendiente | — |
+| NF4 | Pendiente | Pendiente | Pendiente | Pendiente | — |
+| FP8 | Pendiente | Pendiente | Pendiente | Pendiente | — |
 
 ## Metricas de Evaluacion
 

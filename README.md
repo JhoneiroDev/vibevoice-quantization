@@ -14,10 +14,13 @@ Este proyecto constituye el marco experimental de una tesis que evalua tres tecn
 |--------|---------|--------|
 | **Sprint 1** | Infraestructura de datos y set de calibracion | Completado |
 | **Sprint 1.5** | Fine-tuning monolingue espanol (LoRA + Diffusion Head) | Completado |
-| **Sprint 2** | Linea base FP16 + cuantizacion uniforme RTN (INT4) | Pendiente |
-| **Sprint 3** | Reconstruccion de 2do orden GPTQ (INT4) | Pendiente |
+| **Sprint 2** | Linea base FP16 + cuantizacion uniforme RTN (INT4) | Completado |
+| **Sprint 2.5** | Analisis de arquitectura y diagnostico de fallos | Completado |
+| **Sprint 3** | GPTQ manual (INT4, g128) sobre VibeVoice completo | Completado |
 | **Sprint 4** | Hibrido AWQ (INT4) + compensacion LoRA | Pendiente |
 | **Sprint 5** | Benchmark en servidor limitado + validacion estadistica | Pendiente |
+
+Ver [`docs/quantization_architecture_analysis.md`](docs/quantization_architecture_analysis.md) para el analisis completo de la arquitectura, compatibilidad con GPTQ/AWQ, y diagnostico de fallos previos.
 
 ## Arquitectura del Modelo
 
@@ -105,13 +108,18 @@ bash scripts/merge_es_checkpoint.sh
 
 El checkpoint resultante **VibeVoice-ES** se guarda en `weights/vibevoice-1.5b-es/` (~10 GB, 3 shards `.safetensors`).
 
-### 3. Pipeline de cuantizacion — Sprints 2 al 5
+### 3. Pipeline de cuantizacion — Sprints 1 al 5
 
-Ejecutar las celdas del notebook principal secuencialmente:
+Ejecutar `notebooks/tesis_model_cuantization.ipynb` secuencialmente. Los scripts de shell se ejecutan desde terminal.
 
-```
-notebooks/tesis_model_cuantization.ipynb
-```
+### Resultados actuales (Sprints 1-3):
+
+| Sprint | Modelo | WER | PPL |
+|--------|--------|-----|-----|
+| Sprint 1 | Datos + calibracion | — | — |
+| Sprint 1.5 | VibeVoice-ES (fine-tuned) | — | — |
+| Sprint 2 | FP16 + RTN-INT4 | 0.54 / 0.38 | — |
+| Sprint 3 | GPTQ-INT4 (manual) | 0.27 | 12.76 |
 
 **Precaucion:** antes de cualquier import del modelo, aplicar el parche obligatorio de `CONFIG_MAPPING` (colision de nombres en `transformers>=4.45.x`):
 
@@ -131,15 +139,25 @@ if hasattr(transformers, "CONFIG_MAPPING"):
   - **Sprint 4 — LoRA de compensacion:** Adaptador post-cuantizacion AWQ para recuperar error acustico; opera sobre modelo congelado ya comprimido.
 - **Dataset:** `fsicoli/common_voice_17_0` (config `"es"`), mirror comunitario del dataset original de Mozilla (retirado Oct 2025). Audio original a 48kHz → remuestreo a 24kHz + normalizacion a -25 dB FS.
 - **Set de calibracion:** 512 muestras del split `validation`, concatenadas en `data/calibration_tensor.pt` (285 MB, `float32`), requerido por GPTQ y AWQ para recolectar estadisticas de activacion.
+- **Cuantizabilidad:** Arquitectura confirmada compatible con GPTQ/AWQ. Todas las capas proyectivas son `nn.Linear` estandar. Los tokenizers convolucionales (~35% params) se preservan en FP16. VRAM esperada post-cuantizacion: ~2.5-3.5 GB.
+- **bitsandbytes NO recomendado para despliegue:** Overhead de +38% VRAM (6.97 GB vs 5.04 GB FP16). Usar solo como baseline comparativa.
 
 ## Variantes de Cuantizacion (PTQ a INT4)
 
-| Variante | Tecnica | Libreria | Descripcion |
+| Variante | Tecnica | Libreria | Resultados |
 |---|---|---|---|
-| **FP16** ($O_1$) | Linea base sin compresion | — | 5.04 GB VRAM en reposo |
-| **RTN** ($X_1$) | Round-to-Nearest uniforme | bitsandbytes | Baseline ingenua: redondeo directo, maximo ruido de cuantizacion |
-| **GPTQ** ($X_2$) | Reconstruccion por Hessiana de 2do orden | auto-gptq | Correccion fila por fila en bloques g128, minimizando error cuadratico |
-| **AWQ+LoRA** ($X_3$) | Proteccion de canales salientes + adaptador | autoawq + PEFT | Estrategia hibrida propuesta: pesos criticos protegidos + compensacion ligera |
+| **FP16** ($O_1$) | Linea base sin compresion | — | 5.04 GB VRAM, RTF=1.35, WER=0.54 |
+| **RTN** ($X_1$) | Round-to-Nearest uniforme | bitsandbytes | 6.97 GB VRAM (+38%), RTF=1.48, WER=0.38 |
+| **GPTQ** ($X_2$) | Reconstruccion por Hessiana | PyTorch puro | 6.18 GB VRAM, RTF=1.23, WER=0.27, PPL=12.76 |
+| **AWQ+LoRA** ($X_3$) | Proteccion de canales + adaptador | autoawq + PEFT | Pendiente (Sprint 4) |
+
+### Tabla Comparativa Final (Sprints 1-3)
+
+| Modelo | VRAM (GB) | RTF | WER | CER | PPL |
+|--------|-----------|-----|-----|-----|-----|
+| FP16 | 5.04 | 1.35 | 0.5385 | 0.3134 | — |
+| RTN-INT4 | 6.97 | 1.48 | 0.3846 | 0.1493 | — |
+| GPTQ-INT4 | 6.18 | 1.23 | 0.2746 | 0.1774 | 12.76 |
 
 ## Metricas de Evaluacion
 

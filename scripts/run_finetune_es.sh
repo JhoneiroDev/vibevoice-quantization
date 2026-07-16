@@ -45,9 +45,9 @@ echo ""
     --remove_unused_columns False \
     --gradient_checkpointing False \
     --ddpm_batch_mul 1 \
-    --diffusion_loss_weight 1.4 \
+    --diffusion_loss_weight 1.0 \
     --train_diffusion_head True \
-    --ce_loss_weight 0.04 \
+    --ce_loss_weight 1.0 \
     --voice_prompt_drop_rate 1.0 \
     --lora_r 8 \
     --lora_alpha 32 \

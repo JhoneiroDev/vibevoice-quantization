@@ -17,7 +17,7 @@ Este proyecto constituye el marco experimental de una tesis que evalua tres tecn
 | **Sprint 2** | Linea base FP16 + cuantizacion uniforme RTN (INT4) | Completado |
 | **Sprint 2.5** | Analisis de arquitectura y diagnostico de fallos | Completado |
 | **Sprint 3** | GPTQ manual (INT4, g128) sobre VibeVoice completo | Completado |
-| **Sprint 4** | Hibrido AWQ (INT4) + compensacion LoRA | Pendiente |
+| **Sprint 4** | AWQ via llmcompressor (qforge) + compensacion LoRA | Pendiente |
 | **Sprint 5** | INT8 selectiva (Fabio Sarracino + HelpfulHand3) | Pendiente |
 | **Sprint 6** | NF4 + double quant (DevParker/Dubedo + Soniqo) | Pendiente |
 | **Sprint 7** | FP8 E4M3FN (Zhao-Kun + CyberVoice) | Pendiente |
@@ -58,8 +58,8 @@ Ver [`docs/quantization_architecture_analysis.md`](docs/quantization_architectur
 | Diffusers | 0.38.0 | Cabezal de difusion acustica |
 | PEFT | 0.19.1 | Adaptadores LoRA |
 | bitsandbytes | 0.49.2 | Cuantizacion RTN/NF4 |
-| auto-gptq | — | Cuantizacion por Hessiana de 2do orden |
-| autoawq | — | Cuantizacion consciente de activaciones |
+| auto-gptq / GPTQModel | — | Cuantizacion por Hessiana de 2do orden |
+| llmcompressor (NM) | — | AWQ via Neural Magic |
 | Numba | 0.65.1 | Tokenizador acustico continuo |
 | Datasets | 3.5.0 | Carga de Common Voice 17.0 |
 | librosa | 0.11.0 | Remuestreo y preprocesamiento de audio |
@@ -157,7 +157,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 | **FP16** ($O_1$) | Linea base sin compresion | — | 5.04 GB VRAM, RTF=1.35, WER=0.54 |
 | **RTN** ($X_1$) | Round-to-Nearest uniforme | bitsandbytes | 6.97 GB VRAM (+38%), RTF=1.48, WER=0.38 |
 | **GPTQ** ($X_2$) | Reconstruccion por Hessiana | PyTorch puro | 6.18 GB VRAM, RTF=1.23, WER=0.27, PPL=12.76 |
-| **AWQ+LoRA** ($X_3$) | Proteccion de canales + Marlin kernels | autoawq + PEFT | Pendiente (Sprint 4, estrategia Ncoder-ai) |
+| **AWQ+LoRA** ($X_3$) | Proteccion de canales via llmcompressor | llmcompressor + PEFT | Pendiente (Sprint 4, estrategia Ncoder-ai) |
 | **INT8** | Selectiva LLM-only | bitsandbytes | Pendiente (Sprint 5) |
 | **NF4** | NormalFloat4 + double quant | bitsandbytes | Pendiente (Sprint 6) |
 | **FP8** | Punto flotante 8-bit nativo | torch.float8_e4m3fn | Pendiente (Sprint 7) |

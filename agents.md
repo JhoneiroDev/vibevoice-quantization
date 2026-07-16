@@ -122,7 +122,7 @@ OpenCode debe construir un script unificado de benchmarking que someta al modelo
 
 1. **Variante $X_1$ - Cuantización Uniforme Estándar (RTN / NormalFloat4):** Redondeo directo al entero más cercano mediante `bitsandbytes`. Servirá como la línea base comprimida para documentar el impacto del ruido de cuantización directo.
 2. **Variante $X_2$ - Reconstrucción por Capas de Segundo Orden (GPTQ):** Implementar la cuantización empleando la inversa de la matriz Hessiana para corregir los pesos fila por fila en bloques de 128 (*g128*), minimizando el error cuadrático total de reconstrucción.
-3. **Variante $X_3$ - AWQ + Marlin (Ncoder-ai):** Calibracion con 256 prompts híbridos de diálogo multi-hablante. Kernels Marlin fusionados para de-cuantizacion en registros (Ada Lovelace). Target: ~50% reduccion VRAM con calidad preservada.
+3. **Variante $X_3$ - AWQ via llmcompressor (Ncoder-ai):** `llmcompressor.compress()` con `AWQModifier(w_bit=4, group_size=128, zero_point=True)`. Calibracion con 256 prompts hibridos de dialogo multi-hablante. Target: ~50% reduccion VRAM con calidad preservada.
 4. **Variante $X_4$ - Cuantización Selectiva INT8 (Fabio Sarracino):** `BitsAndBytesConfig(load_in_8bit=True)` solo sobre el LLM (Qwen2), preservando audio modules en FP16. Minimiza degradación acústica.
 5. **Variante $X_5$ - Cuantización NF4 + Double Quant (DevParker/Dubedo):** `bnb_4bit_quant_type="nf4"` con double quantization. Distribución normal de pesos para mejor ajuste que RTN.
 6. **Variante $X_6$ - Cuantización FP8 E4M3FN (Zhao-Kun):** `torch.float8_e4m3fn` nativo en PyTorch 2.12+. Ada Lovelace (RTX 4060 Ti) con soporte hardware FP8 vía Tensor Cores 4ta Gen.

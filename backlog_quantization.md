@@ -8,9 +8,9 @@ Este documento registra la planificación por Sprints, el estado de las tareas y
 | ------ | ------ | ------ | ------ |
 | **Sprint 1** | Ingesta de Datos, Partición y Set de Calibración | COMPLETADO | 100% |
 | **Sprint 1.5** | Fine-Tuning Monolingüe Español (LoRA + Diffusion Head) | COMPLETADO | 100% |
-| **Sprint 2** | RTN-INT4 via bitsandbytes (split layout) | IMPLEMENTADO | 100% |
+| **Sprint 2** | RTN-INT4 via bitsandbytes directo (DevParker) | IMPLEMENTADO | 100% |
 | **Sprint 3** | GPTQ-INT4 via GPTQModel (qforge, split layout) | IMPLEMENTADO | 100% |
-| **Sprint 4** | AWQ-INT4 Marlin (qforge) + LoRA compensacion | IMPLEMENTADO | 100% |
+| **Sprint 4** | AWQ via AutoAWQ (ncoder-ai, vibevoice nativo) | IMPLEMENTADO | 100% |
 | **Sprint 5** | INT8 via bitsandbytes (split layout) | IMPLEMENTADO | 100% |
 | **Sprint 6** | NF4 + Double Quant via bitsandbytes (split layout) | IMPLEMENTADO | 100% |
 | **Sprint 7** | FP8 E4M3FN via torch nativo (split layout) | IMPLEMENTADO | 100% |
@@ -23,7 +23,7 @@ Este documento registra la planificación por Sprints, el estado de las tareas y
 | Entorno | transformers | Propósito | Sprints |
 |---------|-------------|-----------|---------|
 | `vibevoice` | 4.51.3 | VibeVoice inference, extraccion, reinsercion, bnb, FP8, benchmark | 2, 5, 6, 7, 8 |
-| `qforge` | >=5.4.0 | GPTQModel + autoawq (cuantizacion del Qwen2 standalone) | 3, 4 |
+| `qforge` | >=5.4.0 | GPTQModel + llmcompressor (cuantizacion del Qwen2 standalone) | 3, 4 |
 
 ```bash
 # Setup unico para qforge:
@@ -68,23 +68,19 @@ Para cada tecnica, en `vibevoice`:
 - 18.6h, 5263 pasos, 1 epoch. CE loss: 1.93→1.72
 - Merge verificado: `weights/vibevoice-1.5b-es/` (10.3 GB, VRAM: 5.04 GB)
 
-##### Sprint 2: RTN-INT4 via bitsandbytes ✅
-- **Implementacion:** `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="fp4")` sobre Qwen2 standalone
-- **Split layout:** `decoder-rtn/` con pesos FP16 dequantizados
-- **Sin calibracion.** Baseline automatico de la industria
-- Celda: `s2-rtn-bnb`
+##### Sprint 2: RTN-INT4 via bitsandbytes (DevParker approach) ✅
+- **Implementacion:** `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="fp4")` + `llm_int8_skip_modules` directo sobre VibeVoice-ES.
+- **Resultado:** VRAM reposo=3.30 GB (-35% vs FP16), WER=0.50 (multi-sample 4 frases). Audio generado exitosamente en todas las muestras.
+- **Validacion:** `llm_int8_skip_modules` previene corrupcion de audio (hallazgo DevParker). fp4 es baseline — NF4 (Sprint 6) mejora calidad.
 
-##### Sprint 3: GPTQ-INT4 via GPTQModel (qforge) ✅
-- **Implementacion:** `GPTQModel.from_pretrained()` + `model.quantize(calib_data)` en qforge
-- **Calibracion:** 256 chunks concatenados de CV17 (~512 tokens avg)
-- **Config:** bits=4, group_size=128, sym=True, damp_percent=0.1 (>=0.1 para LoRA), desc_act=False
-- **Split layout:** `decoder-gptq/` con INT4 empaquetado real (kernels CUDA)
-- Celda: `s3-gptqmodel`
+##### Sprint 3: GPTQ-INT4 via GPTQModel (qforge) + merge directo ✅
+- **Resultado:** Disco 6.3GB→1.07GB (-83%). VRAM reposo=5.04 GB, WER=0.47 (mejor que FP16 0.54 y RTN 0.50). RTF=3.65 (dequantizacion INT4→FP16 en computo).
+- **Flujo final:** GPTQModel en qforge sobre Qwen2 standalone → reemplazo in-place de language_model en VibeVoice-ES → benchmark directo sin guardar/cargar.
 
-##### Sprint 4: AWQ-INT4 Marlin (qforge) + LoRA (vibevoice) ✅
-- **Parte A (qforge):** `AutoAWQForCausalLM.from_pretrained()` + `model.quantize(tokenizer, quant_config={"zero_point":True, "q_group_size":128, "w_bit":4, "version":"Marlin"})`
+##### Sprint 4: AWQ-INT4 via llmcompressor (qforge) + LoRA (vibevoice) ✅
+- **Parte A (vibevoice):** `AutoAWQ` nativo (wheel pre-compilado, sin qforge). `quant_config={"zero_point":True, "q_group_size":128, "w_bit":4, "version":"GEMM"}` sobre Qwen2 standalone. Cuantizacion en vibevoice directo.
 - **Calibracion:** 256 prompts hibridos narracion+dialogo multi-hablante
-- **Split layout:** `decoder-awq/` con kernels Marlin para Ada Lovelace
+- **Split layout:** `decoder-awq/` con llmcompressor (Neural Magic) para Ada Lovelace
 - **Parte B (vibevoice):** LoRA rank=8 via PEFT sobre q_proj/v_proj. Fine-tuning 200 pasos con 10K muestras CV17. `merge_and_unload()`
 - Celdas: `s4-awq-marlin`, `s4-lora`
 

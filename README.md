@@ -19,7 +19,7 @@ Este proyecto constituye el marco experimental de una tesis que evalua tres tecn
 | **Sprint 3** | GPTQ manual (INT4, g128) sobre VibeVoice completo | Completado |
 | **Sprint 4** | AWQ via AutoAWQ (vibevoice nativo) | Completado |
 | **Sprint 5** | INT8 selectiva (Fabio Sarracino + HelpfulHand3) | Pendiente |
-| **Sprint 6** | NF4 + double quant (DevParker/Dubedo + Soniqo) | Pendiente |
+| **Sprint 6** | NF4 + double quant (DevParker/Dubedo + Soniqo) | Implementado, benchmark pendiente |
 | **Sprint 7** | FP8 E4M3FN (Zhao-Kun + CyberVoice) | Pendiente |
 | **Sprint 8** | 🏁 Benchmark: 6 modelos + validacion estadistica | Pendiente |
 
@@ -141,7 +141,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 - **Dataset:** `fsicoli/common_voice_17_0` (config `"es"`), mirror comunitario del dataset original de Mozilla (retirado Oct 2025). Audio original a 48kHz → remuestreo a 24kHz + normalizacion a -25 dB FS.
 - **Set de calibracion:** 512 muestras del split `validation`, concatenadas en `data/calibration_tensor.pt` (285 MB, `float32`), requerido por GPTQ y AWQ para recolectar estadisticas de activacion.
 - **Cuantizabilidad:** Arquitectura confirmada compatible con GPTQ/AWQ. Todas las capas proyectivas son `nn.Linear` estandar. Los tokenizers convolucionales (~35% params) se preservan en FP16. VRAM esperada post-cuantizacion: ~2.5-3.5 GB.
-- **bitsandbytes NO recomendado para despliegue:** Overhead de +38% VRAM (6.97 GB vs 5.04 GB FP16). Usar solo como baseline comparativa.
+- **FP4 lineal de bitsandbytes no recomendado para despliegue:** La baseline RTN mostro overhead. INT8 selectivo y NF4 con Double Quant usan persistencia nativa y deben evaluarse por separado.
 - **Conv1D debe permanecer en FP16/FP32:** Cuantizar capas convolucionales de tokenizers corrompe las salidas acusticas (hallazgo Mudler/LocalAI). Refuerza exclusion de `acoustic_tokenizer` y `semantic_tokenizer`.
 - **AdaLN del diffusion head es fragil bajo INT4:** Los bloques Adaptive Layer Normalization fallan bajo ciertos esquemas INT4 (hallazgo FluffyBunnies/ONNX). Considerar FP16 o FP8 para diffusion head.
 - **DPM-Solver sensible a INT:** El desnatador de ruido del diffusion head genera "voz metalica" bajo cuantizacion entera. FP8 lo elimina al mantener exponentes flotantes (CyberVoice Labs).
@@ -157,7 +157,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 | **GPTQ** ($X_2$) | Reconstruccion por Hessiana | PyTorch puro | 6.18 GB VRAM, RTF=1.23, WER=0.27, PPL=12.76 |
 | **AWQ** ($X_3$) | Proteccion de canales por activaciones | AutoAWQ | Completado (Sprint 4) |
 | **INT8** | Selectiva LLM-only | bitsandbytes | Pendiente (Sprint 5) |
-| **NF4** | NormalFloat4 + double quant | bitsandbytes | Pendiente (Sprint 6) |
+| **NF4** | NormalFloat4 + double quant selectivo | bitsandbytes | Implementado; 3.25 GB VRAM de reposo, benchmark pendiente |
 | **FP8** | Punto flotante 8-bit nativo | torch.float8_e4m3fn | Pendiente (Sprint 7) |
 
 ### Tabla Comparativa Final (Sprint 8 — Benchmark)

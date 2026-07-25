@@ -6,7 +6,7 @@ Optimizacion multi-tecnica post-entrenamiento (PTQ) del modelo TTS **VibeVoice 1
 
 ## Resumen
 
-Este proyecto constituye el marco experimental de una tesis que evalua tres tecnicas de cuantizacion a **INT4** sobre el modelo **VibeVoice-ES** (fine-tuneado en espanol), midiendo el *trade-off* entre eficiencia computacional y preservacion de calidad linguistica. El objetivo es validar que una estrategia hibrida de cuantizacion consciente de activaciones (AWQ) con compensacion ligera (LoRA) permite sintesis de voz conversacional de alta calidad en GPU de consumo de 8GB, acercando modelos de frontera a entornos con recursos limitados.
+Este proyecto constituye el marco experimental de una tesis que evalua tres tecnicas de cuantizacion a **INT4** sobre el modelo **VibeVoice-ES** (fine-tuneado en espanol), midiendo el *trade-off* entre eficiencia computacional y preservacion de calidad linguistica. El objetivo es validar que la cuantizacion consciente de activaciones (AWQ) permite sintesis de voz conversacional de alta calidad en GPU de consumo de 8GB, acercando modelos de frontera a entornos con recursos limitados.
 
 ## Estado de Sprints
 
@@ -17,11 +17,11 @@ Este proyecto constituye el marco experimental de una tesis que evalua tres tecn
 | **Sprint 2** | Linea base FP16 + cuantizacion uniforme RTN (INT4) | Completado |
 | **Sprint 2.5** | Analisis de arquitectura y diagnostico de fallos | Completado |
 | **Sprint 3** | GPTQ manual (INT4, g128) sobre VibeVoice completo | Completado |
-| **Sprint 4** | AWQ via llmcompressor (qforge) + compensacion LoRA | Pendiente |
+| **Sprint 4** | AWQ via AutoAWQ (vibevoice nativo) | Completado |
 | **Sprint 5** | INT8 selectiva (Fabio Sarracino + HelpfulHand3) | Pendiente |
 | **Sprint 6** | NF4 + double quant (DevParker/Dubedo + Soniqo) | Pendiente |
 | **Sprint 7** | FP8 E4M3FN (Zhao-Kun + CyberVoice) | Pendiente |
-| **Sprint 8** | 🏁 Benchmark: 7 modelos + validacion estadistica | Pendiente |
+| **Sprint 8** | 🏁 Benchmark: 6 modelos + validacion estadistica | Pendiente |
 
 Ver [`docs/quantization_architecture_analysis.md`](docs/quantization_architecture_analysis.md) para el analisis completo de la arquitectura, compatibilidad con GPTQ/AWQ, y diagnostico de fallos previos.
 
@@ -102,7 +102,7 @@ python verify_stack.py
 
 ### 2. Fine-tuning monolingue (espanol) — Sprint 1.5
 
-Usa el split `train` de Common Voice 17.0 (336,846 registros). Parametros: `lora_r=8`, `bf16=True`, `per_device_train_batch_size=1`, `gradient_accumulation_steps=32`, `voice_prompt_drop_rate=1.0`.
+Usa el split `train` de Common Voice 17.0 (336,846 registros). Parametros: `lora_r=8`, `bf16=True`, `per_device_train_batch_size=1`, `gradient_accumulation_steps=64`, `voice_prompt_drop_rate=1.0`.
 
 ```bash
 bash scripts/run_finetune_es.sh
@@ -137,9 +137,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 ## Notas Tecnicas
 
 - **Flash Attention:** NO instalado. Compilar `flash-attn` desde fuente satura la RAM de WSL2. Se usa PyTorch SDPA nativa con `attn_implementation="sdpa"`.
-- **Dos estrategias LoRA independientes:**
-  - **Sprint 1.5 — LoRA de adaptacion linguistica:** Fine-tuning pre-cuantizacion sobre datos en espanol; sus pesos se mergean al modelo base.
-  - **Sprint 4 — LoRA de compensacion:** Adaptador post-cuantizacion AWQ para recuperar error acustico; opera sobre modelo congelado ya comprimido.
+- **LoRA de adaptacion linguistica (Sprint 1.5):** Fine-tuning pre-cuantizacion sobre datos en espanol; sus pesos se mergean al modelo base. Es el unico LoRA del proyecto: el LoRA de compensacion post-AWQ (Sprint 4) se descarto porque peft no admite adaptadores sobre las capas `WQLinear` de AutoAWQ.
 - **Dataset:** `fsicoli/common_voice_17_0` (config `"es"`), mirror comunitario del dataset original de Mozilla (retirado Oct 2025). Audio original a 48kHz → remuestreo a 24kHz + normalizacion a -25 dB FS.
 - **Set de calibracion:** 512 muestras del split `validation`, concatenadas en `data/calibration_tensor.pt` (285 MB, `float32`), requerido por GPTQ y AWQ para recolectar estadisticas de activacion.
 - **Cuantizabilidad:** Arquitectura confirmada compatible con GPTQ/AWQ. Todas las capas proyectivas son `nn.Linear` estandar. Los tokenizers convolucionales (~35% params) se preservan en FP16. VRAM esperada post-cuantizacion: ~2.5-3.5 GB.
@@ -157,7 +155,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 | **FP16** ($O_1$) | Linea base sin compresion | — | 5.04 GB VRAM, RTF=1.35, WER=0.54 |
 | **RTN** ($X_1$) | Round-to-Nearest uniforme | bitsandbytes | 6.97 GB VRAM (+38%), RTF=1.48, WER=0.38 |
 | **GPTQ** ($X_2$) | Reconstruccion por Hessiana | PyTorch puro | 6.18 GB VRAM, RTF=1.23, WER=0.27, PPL=12.76 |
-| **AWQ+LoRA** ($X_3$) | Proteccion de canales via llmcompressor | llmcompressor + PEFT | Pendiente (Sprint 4, estrategia Ncoder-ai) |
+| **AWQ** ($X_3$) | Proteccion de canales por activaciones | AutoAWQ | Completado (Sprint 4) |
 | **INT8** | Selectiva LLM-only | bitsandbytes | Pendiente (Sprint 5) |
 | **NF4** | NormalFloat4 + double quant | bitsandbytes | Pendiente (Sprint 6) |
 | **FP8** | Punto flotante 8-bit nativo | torch.float8_e4m3fn | Pendiente (Sprint 7) |
@@ -169,7 +167,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 | FP16 | 5.04 | 1.35 | 0.5385 | 0.3134 | — |
 | RTN-INT4 | 6.97 | 1.48 | 0.3846 | 0.1493 | — |
 | GPTQ-INT4 | 6.18 | 1.23 | 0.2746 | 0.1774 | 12.76 |
-| AWQ+LoRA | Pendiente | Pendiente | Pendiente | Pendiente | — |
+| AWQ | Pendiente | Pendiente | Pendiente | Pendiente | — |
 | INT8 | Pendiente | Pendiente | Pendiente | Pendiente | — |
 | NF4 | Pendiente | Pendiente | Pendiente | Pendiente | — |
 | FP8 | Pendiente | Pendiente | Pendiente | Pendiente | — |

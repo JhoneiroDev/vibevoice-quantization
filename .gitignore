@@ -10,6 +10,7 @@ agents.md
 backlog_quantization.md
 resultados_bloques.md
 datasetmozilla.md
+docs/*.md
 
 # Python
 __pycache__/

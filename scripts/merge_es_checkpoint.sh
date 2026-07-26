@@ -1,26 +1,32 @@
 #!/bin/bash
 # ============================================================
-# Sprint 1.5: Merge LoRA -> VibeVoice-ES
+# Sprint 1.5: Merge LoRA correctivo -> VibeVoice-ES corregido
 # ============================================================
 set -e
 
-cd /home/alfrog/projects/VibeVoice_Optimization
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON_BIN="/home/alfrog/micromamba/envs/vibevoice/bin/python"
+BASE_MODEL="$PROJECT_ROOT/weights/vibevoice-1.5b-es"
+CHECKPOINT="$PROJECT_ROOT/outputs/finetune_vibevoice_es_correction/lora"
+MERGE_OUTPUT="$PROJECT_ROOT/weights/vibevoice-1.5b-es-corrected"
+cd "$PROJECT_ROOT"
 
 # Inyectar VibeVoice_repo en PYTHONPATH
-export PYTHONPATH="/home/alfrog/projects/VibeVoice_Optimization/VibeVoice_repo:$PYTHONPATH"
+export PYTHONPATH="$PROJECT_ROOT/VibeVoice_repo:$PYTHONPATH"
 
-echo "=== Mergeando LoRA + Diffusion Head al modelo base ==="
-echo "Checkpoint LoRA : /home/alfrog/projects/VibeVoice_Optimization/outputs/finetune_vibevoice_es"
-echo "Modelo base     : /home/alfrog/projects/VibeVoice_Optimization/weights/vibevoice-1.5b"
-echo "Output (ES)     : /home/alfrog/projects/VibeVoice_Optimization/weights/vibevoice-1.5b-es"
+echo "[S1.5-05] Mergeando LoRA correctivo sobre VibeVoice-ES"
+echo "Checkpoint LoRA : $CHECKPOINT"
+echo "Modelo base     : $BASE_MODEL"
+echo "Output (ES)     : $MERGE_OUTPUT"
 echo ""
 
-/home/alfrog/micromamba/envs/vibevoice/bin/python -m vibevoice.scripts.merge_vibevoice_models \
-    --base_model_path /home/alfrog/projects/VibeVoice_Optimization/weights/vibevoice-1.5b \
-    --checkpoint_path /home/alfrog/projects/VibeVoice_Optimization/outputs/finetune_vibevoice_es/lora \
-    --output_path /home/alfrog/projects/VibeVoice_Optimization/weights/vibevoice-1.5b-es \
-    --output_format safetensors
+$PYTHON_BIN -m vibevoice.scripts.merge_vibevoice_models \
+    --base_model_path "$BASE_MODEL" \
+    --checkpoint_path "$CHECKPOINT" \
+    --output_path "$MERGE_OUTPUT" \
+    --output_format safetensors \
+    --output_dtype bfloat16
 
 echo ""
-echo "=== VibeVoice-ES generado en: /home/alfrog/projects/VibeVoice_Optimization/weights/vibevoice-1.5b-es ==="
-ls -lh /home/alfrog/projects/VibeVoice_Optimization/weights/vibevoice-1.5b-es/*.safetensors 2>/dev/null || echo "(verificar estructura)"
+echo "[S1.5-05] VibeVoice-ES corregido en: $MERGE_OUTPUT"
+ls -lh "$MERGE_OUTPUT"/*.safetensors 2>/dev/null || echo "(verificar estructura)"

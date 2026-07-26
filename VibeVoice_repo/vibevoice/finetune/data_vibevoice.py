@@ -25,10 +25,22 @@ def _resample_if_needed(wav: np.ndarray, orig_sr: int, target_sr: int) -> np.nda
         return resampy.resample(wav.astype(np.float32), orig_sr, target_sr)
     if librosa is not None:
         return librosa.resample(y=wav.astype(np.float32), orig_sr=orig_sr, target_sr=target_sr)
-    warnings.warn(
-        "No resampler available; treating audio as target_sr without resampling. Install resampy or librosa.",
-        RuntimeWarning,
+    raise RuntimeError(
+        "Audio resampling is required but neither resampy nor librosa is available."
     )
+
+
+def _normalize_audio(wav: np.ndarray, target_dbfs: float = -25.0) -> np.ndarray:
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if wav.size == 0 or not np.isfinite(wav).all():
+        raise ValueError("Audio must be non-empty and contain only finite values.")
+    rms = float(np.sqrt(np.mean(np.square(wav, dtype=np.float64))))
+    if rms < 1e-6:
+        raise ValueError("Audio is silent or has near-zero RMS.")
+    wav = wav * ((10.0 ** (target_dbfs / 20.0)) / rms)
+    peak = float(np.max(np.abs(wav)))
+    if peak > 1.0:
+        wav = wav / peak
     return wav.astype(np.float32, copy=False)
 
 
@@ -40,11 +52,13 @@ class VibeVoiceDataset:
         text_column: str = "text",
         audio_column: str = "audio",
         voice_prompts_column: Optional[str] = "voice_prompts",
+        voice_prompt_drop_rate: float = 0.0,
     ) -> None:
         self.dataset = dataset
         self.text_column = text_column
         self.audio_column = audio_column
         self.voice_prompts_column = voice_prompts_column
+        self.voice_prompt_drop_rate = float(voice_prompt_drop_rate)
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -65,7 +79,7 @@ class VibeVoiceDataset:
                 data["voice_prompts"] = [user_provided_prompt]
             else:
                 data["voice_prompts"] = user_provided_prompt
-        else:
+        elif self.voice_prompt_drop_rate < 1.0:
             # FALLBACK: No prompt provided, so we auto-generate one from the target audio.
             try:
                 target_sr = 24000
@@ -95,6 +109,8 @@ class VibeVoiceDataset:
             except Exception as e:
                 warnings.warn(f"Could not create voice prompt for item {idx}: {e}")
                 data["voice_prompts"] = None            
+        else:
+            data["voice_prompts"] = None
         return data
 
 
@@ -167,6 +183,7 @@ def _load_audio_to_24k(
     *,
     target_sr: int = 24000,
     augment_with_silence: bool = False,
+    target_dbfs: Optional[float] = -25.0,
 ) -> np.ndarray:
     if isinstance(audio, np.ndarray):
         wav_out = audio.astype(np.float32)
@@ -185,6 +202,11 @@ def _load_audio_to_24k(
         raise ValueError(f"Unsupported audio type: {type(audio)}")
 
     wav_out = np.asarray(wav_out, dtype=np.float32)
+    if wav_out.ndim == 2:
+        wav_out = wav_out.mean(axis=0 if wav_out.shape[0] <= 2 else 1)
+    wav_out = wav_out.reshape(-1)
+    if target_dbfs is not None:
+        wav_out = _normalize_audio(wav_out, target_dbfs)
 
     if augment_with_silence:
         wav_out = _apply_silence_with_crossfade(wav_out, sample_rate=target_sr)
@@ -205,6 +227,8 @@ class VibeVoiceCollator:
     audio_field: str = "audio"
     voice_prompts_field: str = "voice_prompts"
     voice_prompt_drop_rate: float = 0.0
+    target_audio_dbfs: Optional[float] = -25.0
+    augment_target_silence: bool = False
 
     def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         batch_size = len(features)
@@ -246,7 +270,12 @@ class VibeVoiceCollator:
                 speech_input_mask = torch.zeros_like(proc["input_ids"], dtype=torch.bool)
             speech_input_mask_list = speech_input_mask[0].tolist()
 
-            wav_target = _load_audio_to_24k(target_audio, target_sr=24000, augment_with_silence=True)
+            wav_target = _load_audio_to_24k(
+                target_audio,
+                target_sr=24000,
+                augment_with_silence=self.augment_target_silence,
+                target_dbfs=self.target_audio_dbfs,
+            )
             # Prefer exact frame count from acoustic tokenizer if available; fallback to compress ratio
             target_latent_len = None
             try:
@@ -391,39 +420,14 @@ class VibeVoiceCollator:
             speeches_loss_input_tensor = torch.tensor(speeches_loss_input_np, dtype=torch.bool)
 
             # Semantic features
-            if self.compute_semantics and hasattr(self.processor, "semantic_tokenizer") and self.processor.semantic_tokenizer is not None:
-                sem_feats: List[np.ndarray] = []
-                for w in all_speech_waveforms:
-                    try:
-                        # Expect [T, D]  where T ≈ ceil(len(w)/compress_ratio)
-                        sem = self.processor.semantic_tokenizer.encode(w)
-                        sem = np.asarray(sem, dtype=np.float32)
-                    except Exception:
-                        sem = np.zeros((0, self.semantic_vae_dim), dtype=np.float32)
-                    if sem.ndim != 2:
-                        raise RuntimeError(f"Semantic tokenizer returned unexpected shape {sem.shape}. Expect [T, D].")
-                    L = sem.shape[0]
-                    D = sem.shape[1]
-                    if D != self.semantic_vae_dim:
-                        if D < self.semantic_vae_dim:
-                            pad_d = np.zeros((L, self.semantic_vae_dim - D), dtype=np.float32)
-                            sem = np.concatenate([sem, pad_d], axis=1)
-                        else:
-                            sem = sem[:, : self.semantic_vae_dim]
-                    if L < max_latent_len:
-                        pad = np.zeros((max_latent_len - L, self.semantic_vae_dim), dtype=np.float32)
-                        sem = np.concatenate([sem, pad], axis=0)
-                    elif L > max_latent_len:
-                        sem = sem[:max_latent_len]
-                    sem_feats.append(sem.astype(np.float32))
-                speech_semantic_tensors = torch.tensor(np.stack(sem_feats, axis=0), dtype=torch.float32)
-            else:
-                # Semantic tokenizer unavailable while semantics are required for training.
-                # Raise to avoid silently degrading alignment with zeroed features.
+            if self.compute_semantics:
                 raise RuntimeError(
-                    "Semantic features are required but could not be computed. "
-                    "Ensure processor.semantic_tokenizer is available or precompute and provide features."
+                    "CPU collator semantic extraction is unsupported. "
+                    "Set compute_semantics=False and compute features in the model forward."
                 )
+            # The Trainer computes semantic features on GPU from this same
+            # speech batch. None is intentional; zero features are not.
+            speech_semantic_tensors = None
         else:
             speech_tensors_tensor = None
             speech_masks_tensor = None

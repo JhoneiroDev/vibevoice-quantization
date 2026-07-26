@@ -13,14 +13,14 @@ Este proyecto constituye el marco experimental de una tesis que evalua tres tecn
 | Sprint | Enfoque | Estado |
 |--------|---------|--------|
 | **Sprint 1** | Infraestructura de datos y set de calibracion | Completado |
-| **Sprint 1.5** | Fine-tuning monolingue espanol (LoRA + Diffusion Head) | Completado |
+| **Sprint 1.5** | Correccion linguistica espanola (segundo LoRA CE-only) | Implementado, ejecucion pendiente |
 | **Sprint 2** | Linea base FP16 + cuantizacion uniforme RTN (INT4) | Completado |
 | **Sprint 2.5** | Analisis de arquitectura y diagnostico de fallos | Completado |
 | **Sprint 3** | GPTQ manual (INT4, g128) sobre VibeVoice completo | Completado |
 | **Sprint 4** | AWQ via AutoAWQ (vibevoice nativo) | Completado |
 | **Sprint 5** | INT8 selectiva (Fabio Sarracino + HelpfulHand3) | Pendiente |
 | **Sprint 6** | NF4 + double quant (DevParker/Dubedo + Soniqo) | Implementado, benchmark pendiente |
-| **Sprint 7** | FP8 E4M3FN (Zhao-Kun + CyberVoice) | Pendiente |
+| **Sprint 7** | FP8 E4M3FN dinamico (Zhao-Kun + CyberVoice) | Implementado, benchmark pendiente |
 | **Sprint 8** | 🏁 Benchmark: 6 modelos + validacion estadistica | Pendiente |
 
 Ver [`docs/quantization_architecture_analysis.md`](docs/quantization_architecture_analysis.md) para el analisis completo de la arquitectura, compatibilidad con GPTQ/AWQ, y diagnostico de fallos previos.
@@ -102,14 +102,14 @@ python verify_stack.py
 
 ### 2. Fine-tuning monolingue (espanol) — Sprint 1.5
 
-Usa el split `train` de Common Voice 17.0 (336,846 registros). Parametros: `lora_r=8`, `bf16=True`, `per_device_train_batch_size=1`, `gradient_accumulation_steps=64`, `voice_prompt_drop_rate=1.0`.
+Usa `train` de Common Voice 17.0 con un desarrollo speaker-disjoint excluido del entrenamiento. El split nativo `validation` queda reservado para calibracion PTQ. La correccion usa como base `vibevoice-1.5b-es`, LoRA rank 8, LR `1e-5`, CE weight `1.0` y diffusion weight `0.0`; diffusion head, connectors y tokenizers permanecen congelados.
 
 ```bash
 bash scripts/run_finetune_es.sh
 bash scripts/merge_es_checkpoint.sh
 ```
 
-El checkpoint resultante **VibeVoice-ES** se guarda en `weights/vibevoice-1.5b-es/` (~10 GB, 3 shards `.safetensors`).
+El checkpoint resultante **VibeVoice-ES-Corrected** se guarda como BF16 en `weights/vibevoice-1.5b-es-corrected/`. Debe superar el gate WER/CER del notebook antes de regenerar las variantes cuantizadas.
 
 ### 3. Pipeline de cuantizacion — Sprints 1 al 5
 
@@ -158,7 +158,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 | **AWQ** ($X_3$) | Proteccion de canales por activaciones | AutoAWQ | Completado (Sprint 4) |
 | **INT8** | Selectiva LLM-only | bitsandbytes | Pendiente (Sprint 5) |
 | **NF4** | NormalFloat4 + double quant selectivo | bitsandbytes | Implementado; 3.25 GB VRAM de reposo, benchmark pendiente |
-| **FP8** | Punto flotante 8-bit nativo | torch.float8_e4m3fn | Pendiente (Sprint 7) |
+| **FP8** | E4M3FN dinamico, salida BF16 | torch._scaled_mm | Implementado; 3.89 GB VRAM tras recarga, benchmark pendiente |
 
 ### Tabla Comparativa Final (Sprint 8 — Benchmark)
 

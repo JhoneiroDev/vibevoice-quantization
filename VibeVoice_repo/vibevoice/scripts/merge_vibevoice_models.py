@@ -11,6 +11,7 @@ Supports all training configurations from train_vibevoice.py
 """
 
 import argparse
+import gc
 import logging
 import os
 import shutil
@@ -310,11 +311,39 @@ def verify_models_only(
     logger.info("\n✓✓✓ VERIFICATION COMPLETE ✓✓✓")
 
 
+def verify_llm_lora_changed(base_model, merged_model) -> None:
+    """Ensure an LLM-only merge produced a real weight delta."""
+    base_params = dict(base_model.model.language_model.named_parameters())
+    changed = 0
+    max_delta = 0.0
+    for name, merged_param in merged_model.model.language_model.named_parameters():
+        base_param = base_params.get(name)
+        if base_param is None or base_param.shape != merged_param.shape:
+            continue
+        delta = float(
+            (merged_param.detach().float() - base_param.detach().float())
+            .abs()
+            .max()
+            .item()
+        )
+        if delta > 0:
+            changed += 1
+            max_delta = max(max_delta, delta)
+    if changed == 0:
+        raise ValueError("LLM LoRA merge produced no detectable weight changes.")
+    logger.info(
+        "✓ LLM LoRA verification passed: %d tensors changed, max_delta=%.6g",
+        changed,
+        max_delta,
+    )
+
+
 def merge_vibevoice_model(
     base_model_path: str,
     checkpoint_path: str,
     output_path: str,
-    output_format: str = "safetensors"
+    output_format: str = "safetensors",
+    output_dtype: str = "bfloat16",
 ) -> None:
     """
     Universal merge function for VibeVoice models.
@@ -359,6 +388,16 @@ def merge_vibevoice_model(
             merge_semantic=components["semantic_connector"]
         )
     
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    if output_dtype not in dtype_map:
+        raise ValueError(f"Unsupported output dtype: {output_dtype}")
+    base_model = base_model.to(dtype=dtype_map[output_dtype])
+    base_model.config.torch_dtype = dtype_map[output_dtype]
+
     # Save merged model
     logger.info(f"\n=== Saving merged model to: {output_path} ===")
     os.makedirs(output_path, exist_ok=True)
@@ -373,7 +412,6 @@ def merge_vibevoice_model(
     # Copy config and processor files
     logger.info("Copying config and processor files...")
     files_to_copy = [
-        "config.json",
         "preprocessor_config.json",
         "generation_config.json",
         "special_tokens_map.json",
@@ -388,6 +426,11 @@ def merge_vibevoice_model(
         dst = os.path.join(output_path, file)
         if os.path.exists(src):
             shutil.copy2(src, dst)
+
+    # The merged model has already been serialized. Release it before loading
+    # verification copies to keep the merge within the WSL memory budget.
+    del base_model
+    gc.collect()
     
     # Verification
     logger.info("\n=== Verifying merged model ===")
@@ -396,12 +439,17 @@ def merge_vibevoice_model(
         logger.info("Reloading original base model for verification...")
         original_base_model = VibeVoiceForConditionalGeneration.from_pretrained(
             base_model_path,
-            torch_dtype=torch.float32
+            torch_dtype=dtype_map[output_dtype]
         )
         
         logger.info("Loading merged model for verification...")
-        test_model = VibeVoiceForConditionalGeneration.from_pretrained(output_path)
+        test_model = VibeVoiceForConditionalGeneration.from_pretrained(
+            output_path, torch_dtype=dtype_map[output_dtype]
+        )
         logger.info("✓ Model loads successfully")
+
+        if components["llm_lora"]:
+            verify_llm_lora_changed(original_base_model, test_model)
         
         # Detailed verification for each merged component
         if components["diffusion_head"]:
@@ -459,6 +507,13 @@ Examples:
         help="Output format: 'safetensors' (recommended) or 'bin'"
     )
     parser.add_argument(
+        "--output_dtype",
+        type=str,
+        default="bfloat16",
+        choices=["bfloat16", "float16", "float32"],
+        help="Serialized tensor dtype for the merged checkpoint"
+    )
+    parser.add_argument(
         "--verify_only",
         action="store_true",
         help="Only verify existing merge between base_model_path and output_path (no actual merging)"
@@ -482,7 +537,8 @@ Examples:
         base_model_path=args.base_model_path,
         checkpoint_path=args.checkpoint_path,
         output_path=args.output_path,
-        output_format=args.output_format
+        output_format=args.output_format,
+        output_dtype=args.output_dtype
     )
 
 

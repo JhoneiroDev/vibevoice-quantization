@@ -27,74 +27,6 @@ from vibevoice.finetune.data_vibevoice import VibeVoiceDataset, VibeVoiceCollato
 
 logger = logging.getLogger(__name__)
 
-# ================== SAMPLE CALLBACK UTILS ==================
-
-import copy
-import torch
-from transformers import TrainerCallback
-
-class EmaCallback(TrainerCallback):
-    def __init__(self, attr_path="model.prediction_head", decay=0.999, device="cpu"):
-        """
-        attr_path: where the head lives under self.model (Trainer wraps your VibeVoiceForConditionalGeneration)
-        decay:     EMA decay (0.999 ~ stable, 0.9999 ~ very smooth, slower to adapt)
-        """
-        self.attr_path = attr_path
-        self.decay = float(decay)
-        self.device = torch.device(device)
-        self.shadow = None
-        self._orig = None  # store non-EMA weights when we swap
-
-    def _get_module(self, model):
-        # Resolve dotted path like "model.prediction_head"
-        mod = model
-        for name in self.attr_path.split('.'):
-            mod = getattr(mod, name)
-        return mod
-
-    def on_train_begin(self, args, state, control, model=None, **kwargs):
-        head = self._get_module(model)
-        self.shadow = {k: p.detach().to(self.device).clone()
-                       for k, p in head.state_dict().items()}
-
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        if self.shadow is None: return
-        head = self._get_module(model)
-        with torch.no_grad():
-            for k, v in head.state_dict().items():
-                self.shadow[k].mul_(self.decay).add_(v.detach().to(self.device), alpha=(1.0 - self.decay))
-
-    # ---- Swap helpers ----
-    def _swap_in_ema(self, model):
-        head = self._get_module(model)
-        self._orig = copy.deepcopy(head.state_dict())
-        head.load_state_dict(self.shadow, strict=False)
-
-    def _swap_back(self, model):
-        if self._orig is None: return
-        head = self._get_module(model)
-        head.load_state_dict(self._orig, strict=False)
-        self._orig = None
-
-    def on_evaluate(self, args, state, control, model=None, **kwargs):
-        # use EMA during eval
-        self._swap_in_ema(model)
-
-    def on_evaluate_end(self, args, state, control, model=None, **kwargs):
-        self._swap_back(model)
-
-    def on_save(self, args, state, control, model=None, **kwargs):
-        # temporarily swap to EMA, let Trainer save, then swap back
-        self._swap_in_ema(model)
-
-    def on_save_end(self, args, state, control, model=None, **kwargs):
-        self._swap_back(model)
-
-    def on_train_end(self, args, state, control, model=None, **kwargs):
-        # final checkpoint: persist EMA
-        self._swap_in_ema(model)
-
-
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(
@@ -138,6 +70,14 @@ class DataArguments:
     voice_prompt_drop_rate: float = field(
         default=0.0,
         metadata={"help": "Probability to drop conditioning voice prompt during training (0.0 keep always, 1.0 drop always)."},
+    )
+    target_audio_dbfs: Optional[float] = field(
+        default=-25.0,
+        metadata={"help": "Normalize target waveforms to this dBFS value. Use none to disable."},
+    )
+    augment_target_silence: bool = field(
+        default=False,
+        metadata={"help": "Add artificial leading/trailing silence to target audio."},
     )
 
 @dataclass
@@ -511,6 +451,7 @@ def main() -> None:
         text_column=data_args.text_column_name,
         audio_column=data_args.audio_column_name,
         voice_prompts_column=data_args.voice_prompts_column_name,
+        voice_prompt_drop_rate=data_args.voice_prompt_drop_rate,
     )
     eval_dataset = None
     if eval_ds is not None:
@@ -519,6 +460,7 @@ def main() -> None:
             text_column=data_args.text_column_name,
             audio_column=data_args.audio_column_name,
             voice_prompts_column=data_args.voice_prompts_column_name,
+            voice_prompt_drop_rate=data_args.voice_prompt_drop_rate,
         )
 
     # Ratios/dims from processor+model
@@ -530,16 +472,16 @@ def main() -> None:
         except Exception:
             semantic_dim = 128
 
-    compute_semantics_flag = hasattr(processor, "semantic_tokenizer") and processor.semantic_tokenizer is not None
-
     data_collator = VibeVoiceCollator(
         processor=processor,
         max_length=data_args.max_length,
         speech_compress_ratio=speech_compress_ratio,
         semantic_vae_dim=semantic_dim,
-        compute_semantics=compute_semantics_flag,
-        debug_checks=False,
+        compute_semantics=False,
+        debug_checks=True,
         voice_prompt_drop_rate=data_args.voice_prompt_drop_rate,
+        target_audio_dbfs=data_args.target_audio_dbfs,
+        augment_target_silence=data_args.augment_target_silence,
     )
 
     class LoRADebugCallback(TrainerCallback):
@@ -605,6 +547,10 @@ def main() -> None:
     class VibeVoiceTrainer(Trainer):
         def training_forward(self, model: VibeVoiceForConditionalGeneration, inputs: Dict[str, Any]):
             """Custom forward pass for training with new diffusion loss calculation."""
+            # Trainer calls model.train() globally; frozen feature extractors
+            # must remain deterministic.
+            model.model.acoustic_tokenizer.eval()
+            model.model.semantic_tokenizer.eval()
             # Extract inputs
             input_ids = inputs.get("input_ids")
             attention_mask = inputs.get("attention_mask")
@@ -630,7 +576,24 @@ def main() -> None:
             # --- START: Copy of model forward logic with new diffusion loss ---
             x = model.get_input_embeddings()(input_ids)
 
-            semantic_speech_all_connect_features = model.model.semantic_connector(speech_semantic_tensors)
+            if speech_semantic_tensors is None:
+                if speech_tensors is None:
+                    raise RuntimeError("speech_tensors are required to compute semantic features.")
+                semantic_dtype = next(model.model.semantic_tokenizer.parameters()).dtype
+                with torch.no_grad():
+                    semantic_output = model.model.semantic_tokenizer.encode(
+                        speech_tensors.unsqueeze(1).to(dtype=semantic_dtype)
+                    )
+                    speech_semantic_tensors = semantic_output.mean
+                if speech_masks is not None and speech_semantic_tensors.shape[:2] != speech_masks.shape:
+                    raise RuntimeError(
+                        "Semantic tokenizer/mask alignment mismatch: "
+                        f"features={tuple(speech_semantic_tensors.shape[:2])}, "
+                        f"mask={tuple(speech_masks.shape)}"
+                    )
+            semantic_speech_all_connect_features = model.model.semantic_connector(
+                speech_semantic_tensors
+            )
             if speeches_loss_input is not None:
                 # only part audio need diffuse
                 speech_all_features, speech_all_connect_features = model.forward_speech_features(
@@ -647,13 +610,10 @@ def main() -> None:
                     speech_features = speech_all_features[speeches_loss_input & speech_masks] # only part audio need diffuse
                     speech_connect_features = speech_all_connect_features[speeches_loss_input & speech_masks]
                     # Forward-time consistency check: selected latent count should match number of acoustic placeholders
-                    try:
-                        if acoustic_input_mask is not None:
-                            assert speech_connect_features.shape[0] == int(acoustic_input_mask.sum().item()), (
-                                f"Mismatch between selected speech connectors ({speech_connect_features.shape[0]}) and acoustic_input_mask sum ({int(acoustic_input_mask.sum().item())})"
-                            )
-                    except Exception:
-                        pass
+                    if acoustic_loss_mask is not None:
+                        assert speech_connect_features.shape[0] == int(acoustic_loss_mask.sum().item()), (
+                            f"Mismatch between target speech connectors ({speech_connect_features.shape[0]}) and acoustic_loss_mask sum ({int(acoustic_loss_mask.sum().item())})"
+                        )
             else:
                 speech_features, speech_connect_features = model.forward_speech_features(
                         speech_tensors=speech_tensors.type_as(x) if speech_tensors is not None else None,
@@ -683,8 +643,13 @@ def main() -> None:
 
             # --- NEW Diffusion Loss Calculation ---
             diffusion_loss = None
+            speech_len = int(speech_features.shape[0]) if speech_tensors is not None else 0
             # This block is executed only if we are in a context that involves speech.
-            if speech_tensors is not None and acoustic_loss_mask.sum().item() > 0:
+            if (
+                training_args.diffusion_loss_weight > 0
+                and speech_tensors is not None
+                and acoustic_loss_mask.sum().item() > 0
+            ):
                 # Build conditioning mask from positions whose NEXT token is a speech latent (shift left by 1)
                 cond_mask = torch.zeros_like(acoustic_loss_mask, dtype=torch.bool)
                 cond_mask[:, :-1] = acoustic_loss_mask[:, 1:]
@@ -693,12 +658,9 @@ def main() -> None:
                 
                 speech_len, latent_size = speech_features.shape
                 # Sanity check: ensure 1:1 alignment between selected conditions and latents
-                try:
-                    assert condition_features.shape[0] == speech_len, (
-                        f"Mismatch: condition_features={condition_features.shape[0]} vs speech_features={speech_len}"
-                    )
-                except Exception:
-                    pass
+                assert condition_features.shape[0] == speech_len, (
+                    f"Mismatch: condition_features={condition_features.shape[0]} vs speech_features={speech_len}"
+                )
                 
                 noise = torch.randn(
                     (speech_len * ddmp_batch_mul, latent_size),
@@ -745,9 +707,7 @@ def main() -> None:
             else:
                 # Dummy loss for DDP to work when there are no speech samples in a batch,
                 # but we are in a speech context.
-                diffusion_loss = sum(p.sum() for p in model.model.prediction_head.parameters()) * 0.0
-                diffusion_loss += sum(p.sum() for p in model.model.acoustic_connector.parameters()) * 0.0
-                diffusion_loss += sum(p.sum() for p in model.model.semantic_connector.parameters()) * 0.0
+                diffusion_loss = torch.zeros((), device=hidden_states.device, dtype=torch.float32)
             # --- End NEW Diffusion Loss Calculation ---
 
             from vibevoice.modular.modeling_vibevoice import VibeVoiceCausalLMOutputWithPast
@@ -773,19 +733,8 @@ def main() -> None:
             except Exception:
                 target_dtype = model.get_input_embeddings().weight.dtype
 
-            if sem is None:
-                sm = inputs.get("speech_masks")
-                if sm is not None:
-                    zeros = torch.zeros(
-                        sm.size(0), sm.size(1),
-                        getattr(model.config, "semantic_vae_dim", 128),
-                        dtype=target_dtype,
-                        device=sm.device,
-                    )
-                    inputs["speech_semantic_tensors"] = zeros
-            else:
-                if isinstance(sem, torch.Tensor):
-                    inputs["speech_semantic_tensors"] = sem.to(dtype=target_dtype)
+            if isinstance(sem, torch.Tensor):
+                inputs["speech_semantic_tensors"] = sem.to(dtype=target_dtype)
 
             # Use custom training forward pass with new diffusion loss
             outputs = self.training_forward(model, inputs)
@@ -807,9 +756,20 @@ def main() -> None:
                 })
                 if sp_loss_sel is not None and sp_masks is not None and al_mask is not None:
                     if num_tok_loss != num_lat_loss:
-                        logger.warning(f"Loss selection mismatch: acoustic_loss_mask={num_tok_loss} vs speeches_loss_input={num_lat_loss}")
+                        raise RuntimeError(
+                            f"Loss selection mismatch: acoustic_loss_mask={num_tok_loss} "
+                            f"vs speeches_loss_input={num_lat_loss}"
+                        )
             except Exception:
                 pass
+            if sp_loss_sel is not None and sp_masks is not None and al_mask is not None:
+                num_tok_loss = int(al_mask.sum().item())
+                num_lat_loss = int((sp_loss_sel & sp_masks).sum().item())
+                if num_tok_loss != num_lat_loss:
+                    raise RuntimeError(
+                        f"Loss selection mismatch: acoustic_loss_mask={num_tok_loss} "
+                        f"vs speeches_loss_input={num_lat_loss}"
+                    )
 
             # CE Loss
             logits = outputs.logits
@@ -883,6 +843,9 @@ def main() -> None:
   
 
         def _save(self, output_dir: Optional[str] = None, state_dict=None) -> None:
+            # Keep standard Trainer checkpoints resumable (model, config and
+            # training state), then add component-specific merge artifacts.
+            super()._save(output_dir=output_dir, state_dict=state_dict)
             try:
                 target_dir = output_dir or self.args.output_dir
                 lora_out = os.path.join(target_dir, "lora")
@@ -893,15 +856,18 @@ def main() -> None:
                 if hasattr(language_model, "save_pretrained"):
                     language_model.save_pretrained(lora_out)
     
-                # --- Diffusion head PEFT adapters (if LoRA-wrapped) ---
+                # --- Diffusion head (only when it was actually trained) ---
                 pred_head = getattr(self.model.model, "prediction_head", None)
-                if hasattr(pred_head, "save_pretrained"):
+                save_diffusion = bool(
+                    model_args.train_diffusion_head or model_args.lora_wrap_diffusion_head
+                )
+                if save_diffusion and hasattr(pred_head, "save_pretrained"):
                     ph_dir = os.path.join(lora_out, "diffusion_head")
                     os.makedirs(ph_dir, exist_ok=True)
                     pred_head.save_pretrained(ph_dir)
     
                 # --- ALWAYS save FULL diffusion head state_dict for fallback ---
-                if pred_head is not None and hasattr(pred_head, "state_dict"):
+                if save_diffusion and pred_head is not None and hasattr(pred_head, "state_dict"):
                     sd = pred_head.state_dict()
                     torch.save(sd, os.path.join(lora_out, "diffusion_head_full.bin"))
                     ph_dir = os.path.join(lora_out, "diffusion_head")
@@ -910,13 +876,13 @@ def main() -> None:
     
                 # --- Connectors (plain state_dicts) ---
                 ac = getattr(self.model.model, "acoustic_connector", None)
-                if ac is not None:
+                if model_args.train_connectors and ac is not None:
                     ac_dir = os.path.join(lora_out, "acoustic_connector")
                     os.makedirs(ac_dir, exist_ok=True)
                     torch.save(ac.state_dict(), os.path.join(ac_dir, "pytorch_model.bin"))
     
                 se = getattr(self.model.model, "semantic_connector", None)
-                if se is not None:
+                if model_args.train_connectors and se is not None:
                     se_dir = os.path.join(lora_out, "semantic_connector")
                     os.makedirs(se_dir, exist_ok=True)
                     torch.save(se.state_dict(), os.path.join(se_dir, "pytorch_model.bin"))
@@ -929,15 +895,13 @@ def main() -> None:
 
     # Resolve which adapters to apply in samples
 
-    ema_cb = EmaCallback(attr_path="model.prediction_head", decay=0.999, device="cpu")
-
     trainer = VibeVoiceTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        callbacks=[ema_cb, LoRADebugCallback(log_every_n_steps=(int(getattr(training_args, "logging_steps", 50) or 50)))],
+        callbacks=[LoRADebugCallback(log_every_n_steps=(int(getattr(training_args, "logging_steps", 50) or 50)))],
     )
 
     # Optional debug pre-training save
@@ -1008,14 +972,17 @@ def main() -> None:
     
         # Diffusion head PEFT (if any)
         ph = getattr(model.model, "prediction_head", None)
-        if hasattr(ph, "save_pretrained"):
+        save_diffusion = bool(
+            model_args.train_diffusion_head or model_args.lora_wrap_diffusion_head
+        )
+        if save_diffusion and hasattr(ph, "save_pretrained"):
             ph_dir = os.path.join(lora_out, "diffusion_head")
             os.makedirs(ph_dir, exist_ok=True)
             ph.save_pretrained(ph_dir)
     
         # ALWAYS: full diffusion head state_dict fallback
         try:
-            if ph is not None and hasattr(ph, "state_dict"):
+            if save_diffusion and ph is not None and hasattr(ph, "state_dict"):
                 sd = ph.state_dict()
                 torch.save(sd, os.path.join(lora_out, "diffusion_head_full.bin"))
                 ph_dir = os.path.join(lora_out, "diffusion_head")
@@ -1027,7 +994,7 @@ def main() -> None:
         # Connectors (if trained)
         try:
             ac = getattr(model.model, "acoustic_connector", None)
-            if ac is not None:
+            if model_args.train_connectors and ac is not None:
                 ac_dir = os.path.join(lora_out, "acoustic_connector")
                 os.makedirs(ac_dir, exist_ok=True)
                 torch.save(ac.state_dict(), os.path.join(ac_dir, "pytorch_model.bin"))
@@ -1036,7 +1003,7 @@ def main() -> None:
     
         try:
             se = getattr(model.model, "semantic_connector", None)
-            if se is not None:
+            if model_args.train_connectors and se is not None:
                 se_dir = os.path.join(lora_out, "semantic_connector")
                 os.makedirs(se_dir, exist_ok=True)
                 torch.save(se.state_dict(), os.path.join(se_dir, "pytorch_model.bin"))

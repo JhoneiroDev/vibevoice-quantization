@@ -14,7 +14,7 @@ Este proyecto constituye el marco experimental de una tesis que evalua tres tecn
 |--------|---------|--------|
 | **Sprint 1** | Infraestructura de datos y set de calibracion | Completado |
 | **Sprint 1.5** | Correccion linguistica espanola (segundo LoRA CE-only) | Implementado, ejecucion pendiente |
-| **Sprint 2** | Linea base FP16 + cuantizacion uniforme RTN (INT4) | Completado |
+| **Sprint 2** | GGUF IQ4_NL selectivo + runtime C++ CrispASR | Implementado, espera checkpoint corregido |
 | **Sprint 2.5** | Analisis de arquitectura y diagnostico de fallos | Completado |
 | **Sprint 3** | GPTQ manual (INT4, g128) sobre VibeVoice completo | Completado |
 | **Sprint 4** | AWQ via AutoAWQ (vibevoice nativo) | Completado |
@@ -65,6 +65,7 @@ Ver [`docs/quantization_architecture_analysis.md`](docs/quantization_architectur
 | librosa | 0.11.0 | Remuestreo y preprocesamiento de audio |
 | Whisper large-v3 | — | ASR de referencia para WER/CER |
 | JiWER | — | Distancia de edicion (Levenshtein) |
+| CrispASR | 0.8.23 | Conversor, cuantizador IQ4_NL y runtime GGML/C++ |
 
 ## Estructura del Proyecto
 
@@ -77,8 +78,9 @@ VibeVoice_Optimization/
 ├── scripts/
 │   ├── run_finetune_es.sh               # Fine-tuning monolingue (18h en RTX 4060 Ti)
 │   ├── merge_es_checkpoint.sh           # Merge LoRA + Diffusion Head → VibeVoice-ES
-│   ├── _fix_pythonpath.py               # Parche para sys.path del repo
-│   └── _insert_sprint15.py              # Insercion programatica de celdas Sprint 1.5
+│   ├── build_vibevoice_iq4_nl.sh        # Conversion y cuantizacion selectiva GGUF
+│   ├── validate_vibevoice_gguf.py       # Verificacion tensor por tensor
+│   └── smoke_vibevoice_iq4_nl.sh        # Inferencia nativa C++
 ├── VibeVoice_repo/                      # Codigo fuente del fork comunitario
 │   ├── vibevoice/modular/               # Definicion de arquitectura (.py)
 │   ├── vibevoice/finetune/              # Scripts de entrenamiento
@@ -111,7 +113,14 @@ bash scripts/merge_es_checkpoint.sh
 
 El checkpoint resultante **VibeVoice-ES-Corrected** se guarda como BF16 en `weights/vibevoice-1.5b-es-corrected/`. Debe superar el gate WER/CER del notebook antes de regenerar las variantes cuantizadas.
 
-### 3. Pipeline de cuantizacion — Sprints 1 al 5
+Sprint 2 descarga el runtime CUDA precompilado de CrispASR `v0.8.23`, verifica su SHA-256 y guarda el GGUF validado junto con su manifiesto:
+
+```bash
+bash scripts/build_vibevoice_iq4_nl.sh
+bash scripts/smoke_vibevoice_iq4_nl.sh
+```
+
+### 3. Pipeline de cuantizacion — Sprints 1 al 7
 
 Ejecutar `notebooks/tesis_model_cuantization.ipynb` secuencialmente. Los scripts de shell se ejecutan desde terminal.
 
@@ -121,7 +130,7 @@ Ejecutar `notebooks/tesis_model_cuantization.ipynb` secuencialmente. Los scripts
 |--------|--------|-----|-----|
 | Sprint 1 | Datos + calibracion | — | — |
 | Sprint 1.5 | VibeVoice-ES (fine-tuned) | — | — |
-| Sprint 2 | FP16 + RTN-INT4 | 0.54 / 0.38 | — |
+| Sprint 2 | GGUF IQ4_NL selectivo | Pendiente | — |
 | Sprint 3 | GPTQ-INT4 (manual) | 0.27 | 12.76 |
 
 **Precaucion:** antes de cualquier import del modelo, aplicar el parche obligatorio de `CONFIG_MAPPING` (colision de nombres en `transformers>=4.45.x`):
@@ -141,7 +150,8 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 - **Dataset:** `fsicoli/common_voice_17_0` (config `"es"`), mirror comunitario del dataset original de Mozilla (retirado Oct 2025). Audio original a 48kHz → remuestreo a 24kHz + normalizacion a -25 dB FS.
 - **Set de calibracion:** 512 muestras del split `validation`, concatenadas en `data/calibration_tensor.pt` (285 MB, `float32`), requerido por GPTQ y AWQ para recolectar estadisticas de activacion.
 - **Cuantizabilidad:** Arquitectura confirmada compatible con GPTQ/AWQ. Todas las capas proyectivas son `nn.Linear` estandar. Los tokenizers convolucionales (~35% params) se preservan en FP16. VRAM esperada post-cuantizacion: ~2.5-3.5 GB.
-- **FP4 lineal de bitsandbytes no recomendado para despliegue:** La baseline RTN mostro overhead. INT8 selectivo y NF4 con Double Quant usan persistencia nativa y deben evaluarse por separado.
+- **IQ4_NL usa un runtime distinto:** Sprint 2 produce un GGUF monolitico para CrispASR. No es compatible con llama.cpp, `ggc v6` ni con el loader Hugging Face del resto de variantes.
+- **Cota fisica de IQ4_NL:** proteger 1.394B parametros no-Qwen en F16 requiere al menos 2.596 GiB. Con las 196 matrices Qwen en IQ4_NL, el payload minimo es ~3.28 GiB; una huella total menor a 1.2 GB no es compatible con esta estrategia.
 - **Conv1D debe permanecer en FP16/FP32:** Cuantizar capas convolucionales de tokenizers corrompe las salidas acusticas (hallazgo Mudler/LocalAI). Refuerza exclusion de `acoustic_tokenizer` y `semantic_tokenizer`.
 - **AdaLN del diffusion head es fragil bajo INT4:** Los bloques Adaptive Layer Normalization fallan bajo ciertos esquemas INT4 (hallazgo FluffyBunnies/ONNX). Considerar FP16 o FP8 para diffusion head.
 - **DPM-Solver sensible a INT:** El desnatador de ruido del diffusion head genera "voz metalica" bajo cuantizacion entera. FP8 lo elimina al mantener exponentes flotantes (CyberVoice Labs).
@@ -153,7 +163,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 | Variante | Tecnica | Libreria | Resultados |
 |---|---|---|---|
 | **FP16** ($O_1$) | Linea base sin compresion | — | 5.04 GB VRAM, RTF=1.35, WER=0.54 |
-| **RTN** ($X_1$) | Round-to-Nearest uniforme | bitsandbytes | 6.97 GB VRAM (+38%), RTF=1.48, WER=0.38 |
+| **IQ4_NL** ($X_1$) | LUT no lineal selectiva, Qwen-only | CrispASR/GGML | Implementado; benchmark pendiente |
 | **GPTQ** ($X_2$) | Reconstruccion por Hessiana | PyTorch puro | 6.18 GB VRAM, RTF=1.23, WER=0.27, PPL=12.76 |
 | **AWQ** ($X_3$) | Proteccion de canales por activaciones | AutoAWQ | Completado (Sprint 4) |
 | **INT8** | Selectiva LLM-only | bitsandbytes | Pendiente (Sprint 5) |
@@ -165,7 +175,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 | Modelo | VRAM (GB) | RTF | WER | CER | PPL |
 |--------|-----------|-----|-----|-----|-----|
 | FP16 | 5.04 | 1.35 | 0.5385 | 0.3134 | — |
-| RTN-INT4 | 6.97 | 1.48 | 0.3846 | 0.1493 | — |
+| GGUF IQ4_NL | Pendiente | Pendiente | Pendiente | Pendiente | — |
 | GPTQ-INT4 | 6.18 | 1.23 | 0.2746 | 0.1774 | 12.76 |
 | AWQ | Pendiente | Pendiente | Pendiente | Pendiente | — |
 | INT8 | Pendiente | Pendiente | Pendiente | Pendiente | — |

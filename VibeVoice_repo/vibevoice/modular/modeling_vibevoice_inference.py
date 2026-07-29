@@ -121,7 +121,7 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         Tie the weights between the input embeddings and the output embeddings.
         """
         # Tie lm_head.weight to language_model.embed_tokens.weight
-        if not getattr(self.config, 'tie_word_embeddings', False):
+        if not getattr(self.config.decoder_config, 'tie_word_embeddings', False):
             return
          
         if hasattr(self, 'lm_head') and hasattr(self.model.language_model, 'embed_tokens'):

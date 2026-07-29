@@ -135,11 +135,14 @@ class VibeVoiceModel(VibeVoicePreTrainedModel):
         self.prediction_head = AutoModel.from_config(config.diffusion_head_config).to(dtype)
 
         # Initialize noise scheduler
-        self.noise_scheduler = DPMSolverMultistepScheduler(
-            num_train_timesteps=config.diffusion_head_config.ddpm_num_steps,
-            beta_schedule=config.diffusion_head_config.ddpm_beta_schedule,
-            prediction_type=config.diffusion_head_config.prediction_type
-        )
+        # Scheduler coefficients are small runtime state and must remain materialized
+        # when the model weights are initialized on the meta device.
+        with torch.device("cpu"):
+            self.noise_scheduler = DPMSolverMultistepScheduler(
+                num_train_timesteps=config.diffusion_head_config.ddpm_num_steps,
+                beta_schedule=config.diffusion_head_config.ddpm_beta_schedule,
+                prediction_type=config.diffusion_head_config.prediction_type
+            )
     
     def get_input_embeddings(self):
         if hasattr(self.language_model, 'embed_tokens'):

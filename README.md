@@ -16,7 +16,7 @@ Este proyecto constituye el marco experimental de una tesis que evalua tres tecn
 | **Sprint 1.5** | Correccion linguistica espanola (segundo LoRA CE-only) | Implementado, ejecucion pendiente |
 | **Sprint 2** | GGUF IQ4_NL selectivo + runtime C++ CrispASR | Implementado, espera checkpoint corregido |
 | **Sprint 2.5** | Analisis de arquitectura y diagnostico de fallos | Completado |
-| **Sprint 3** | GPTQ manual (INT4, g128) sobre VibeVoice completo | Completado |
+| **Sprint 3** | GPTQ W4 g128 selectivo con loader hibrido Triton | Implementado, espera checkpoint corregido |
 | **Sprint 4** | AWQ via AutoAWQ (vibevoice nativo) | Completado |
 | **Sprint 5** | INT8 selectiva (Fabio Sarracino + HelpfulHand3) | Pendiente |
 | **Sprint 6** | NF4 + double quant (DevParker/Dubedo + Soniqo) | Implementado, benchmark pendiente |
@@ -58,7 +58,7 @@ Ver [`docs/quantization_architecture_analysis.md`](docs/quantization_architectur
 | Diffusers | 0.38.0 | Cabezal de difusion acustica |
 | PEFT | 0.19.1 | Adaptadores LoRA |
 | bitsandbytes | 0.49.2 | Cuantizacion RTN/NF4 |
-| auto-gptq / GPTQModel | — | Cuantizacion por Hessiana de 2do orden |
+| GPTQModel | 2.2.0 | GPTQ W4 g128 selectivo con backend Triton |
 | llmcompressor (NM) | — | AWQ via Neural Magic |
 | Numba | 0.65.1 | Tokenizador acustico continuo |
 | Datasets | 3.5.0 | Carga de Common Voice 17.0 |
@@ -80,7 +80,10 @@ VibeVoice_Optimization/
 │   ├── merge_es_checkpoint.sh           # Merge LoRA + Diffusion Head → VibeVoice-ES
 │   ├── build_vibevoice_iq4_nl.sh        # Conversion y cuantizacion selectiva GGUF
 │   ├── validate_vibevoice_gguf.py       # Verificacion tensor por tensor
-│   └── smoke_vibevoice_iq4_nl.sh        # Inferencia nativa C++
+│   ├── smoke_vibevoice_iq4_nl.sh        # Inferencia nativa C++
+│   ├── build_vibevoice_gptq.sh           # GPTQ W4 selectivo y persistente
+│   ├── gptq_vibevoice.py                 # Export, validacion y loader hibrido
+│   └── smoke_vibevoice_gptq.py           # Recarga limpia y smoke TTS GPTQ
 ├── VibeVoice_repo/                      # Codigo fuente del fork comunitario
 │   ├── vibevoice/modular/               # Definicion de arquitectura (.py)
 │   ├── vibevoice/finetune/              # Scripts de entrenamiento
@@ -120,6 +123,16 @@ bash scripts/build_vibevoice_iq4_nl.sh
 bash scripts/smoke_vibevoice_iq4_nl.sh
 ```
 
+Sprint 3 usa GPTQModel en el mismo entorno `vibevoice`. El build guarda por separado el decoder GPTQ y los componentes TTS protegidos; el smoke test siempre recarga ese layout desde cero:
+
+```bash
+bash scripts/setup_gptqmodel.sh
+bash scripts/build_vibevoice_gptq.sh
+python scripts/smoke_vibevoice_gptq.py \
+  --model weights/vibevoice-1.5b-es-gptq \
+  --output outputs/sprint3_gptq/smoke-es.wav
+```
+
 ### 3. Pipeline de cuantizacion — Sprints 1 al 7
 
 Ejecutar `notebooks/tesis_model_cuantization.ipynb` secuencialmente. Los scripts de shell se ejecutan desde terminal.
@@ -131,7 +144,7 @@ Ejecutar `notebooks/tesis_model_cuantization.ipynb` secuencialmente. Los scripts
 | Sprint 1 | Datos + calibracion | — | — |
 | Sprint 1.5 | VibeVoice-ES (fine-tuned) | — | — |
 | Sprint 2 | GGUF IQ4_NL selectivo | Pendiente | — |
-| Sprint 3 | GPTQ-INT4 (manual) | 0.27 | 12.76 |
+| Sprint 3 | GPTQ W4 g128 selectivo | Pendiente | — |
 
 **Precaucion:** antes de cualquier import del modelo, aplicar el parche obligatorio de `CONFIG_MAPPING` (colision de nombres en `transformers>=4.45.x`):
 
@@ -152,6 +165,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 - **Cuantizabilidad:** Arquitectura confirmada compatible con GPTQ/AWQ. Todas las capas proyectivas son `nn.Linear` estandar. Los tokenizers convolucionales (~35% params) se preservan en FP16. VRAM esperada post-cuantizacion: ~2.5-3.5 GB.
 - **IQ4_NL usa un runtime distinto:** Sprint 2 produce un GGUF monolitico para CrispASR. No es compatible con llama.cpp, `ggc v6` ni con el loader Hugging Face del resto de variantes.
 - **Cota fisica de IQ4_NL:** proteger 1.394B parametros no-Qwen en F16 requiere al menos 2.596 GiB. Con las 196 matrices Qwen en IQ4_NL, el payload minimo es ~3.28 GiB; una huella total menor a 1.2 GB no es compatible con esta estrategia.
+- **GPTQ requiere un loader hibrido:** las matrices empaquetadas (`qweight`, `qzeros`, `scales`, `g_idx`) no pueden copiarse a `nn.Linear` mediante `state_dict`. Sprint 3 carga el decoder con GPTQModel/Triton y trasplanta el objeto `Qwen2Model`; los modulos TTS protegidos se cargan por separado en BF16.
 - **Conv1D debe permanecer en FP16/FP32:** Cuantizar capas convolucionales de tokenizers corrompe las salidas acusticas (hallazgo Mudler/LocalAI). Refuerza exclusion de `acoustic_tokenizer` y `semantic_tokenizer`.
 - **AdaLN del diffusion head es fragil bajo INT4:** Los bloques Adaptive Layer Normalization fallan bajo ciertos esquemas INT4 (hallazgo FluffyBunnies/ONNX). Considerar FP16 o FP8 para diffusion head.
 - **DPM-Solver sensible a INT:** El desnatador de ruido del diffusion head genera "voz metalica" bajo cuantizacion entera. FP8 lo elimina al mantener exponentes flotantes (CyberVoice Labs).
@@ -164,7 +178,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 |---|---|---|---|
 | **FP16** ($O_1$) | Linea base sin compresion | — | 5.04 GB VRAM, RTF=1.35, WER=0.54 |
 | **IQ4_NL** ($X_1$) | LUT no lineal selectiva, Qwen-only | CrispASR/GGML | Implementado; benchmark pendiente |
-| **GPTQ** ($X_2$) | Reconstruccion por Hessiana | PyTorch puro | 6.18 GB VRAM, RTF=1.23, WER=0.27, PPL=12.76 |
+| **GPTQ** ($X_2$) | Reconstruccion Hessiana W4 g128, Qwen-only | GPTQModel/Triton | Implementado; benchmark corregido pendiente |
 | **AWQ** ($X_3$) | Proteccion de canales por activaciones | AutoAWQ | Completado (Sprint 4) |
 | **INT8** | Selectiva LLM-only | bitsandbytes | Pendiente (Sprint 5) |
 | **NF4** | NormalFloat4 + double quant selectivo | bitsandbytes | Implementado; 3.25 GB VRAM de reposo, benchmark pendiente |
@@ -176,7 +190,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 |--------|-----------|-----|-----|-----|-----|
 | FP16 | 5.04 | 1.35 | 0.5385 | 0.3134 | — |
 | GGUF IQ4_NL | Pendiente | Pendiente | Pendiente | Pendiente | — |
-| GPTQ-INT4 | 6.18 | 1.23 | 0.2746 | 0.1774 | 12.76 |
+| GPTQ W4 g128 | Pendiente | Pendiente | Pendiente | Pendiente | — |
 | AWQ | Pendiente | Pendiente | Pendiente | Pendiente | — |
 | INT8 | Pendiente | Pendiente | Pendiente | Pendiente | — |
 | NF4 | Pendiente | Pendiente | Pendiente | Pendiente | — |

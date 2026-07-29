@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Fresh-process reload and TTS smoke test for the selective GPTQ artifact."""
+# ruff: noqa: E402
+"""Fresh-process reload and TTS smoke test for the selective AWQ artifact."""
 
 import argparse
 import json
@@ -7,11 +8,11 @@ import sys
 import time
 from pathlib import Path
 
+import jiwer
+import librosa
+import numpy as np
 import soundfile as sf
 import torch
-import numpy as np
-import librosa
-import jiwer
 import whisper
 
 
@@ -19,7 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 
-from gptq_vibevoice import VibeVoiceProcessor, load_gptq_vibevoice
+from awq.modules.linear.gemm import WQLinear_GEMM
+from awq_vibevoice import VibeVoiceProcessor, load_awq_vibevoice
 
 
 def main():
@@ -36,9 +38,17 @@ def main():
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     load_start = time.perf_counter()
-    model = load_gptq_vibevoice(args.model, device="cuda:0", backend="triton")
+    model = load_awq_vibevoice(args.model, device="cuda:0")
     load_seconds = time.perf_counter() - load_start
-    processor = VibeVoiceProcessor.from_pretrained(args.model, local_files_only=True)
+    processor = VibeVoiceProcessor.from_pretrained(
+        args.model, local_files_only=True
+    )
+
+    hits = set()
+    handles = []
+    for name, module in model.model.language_model.named_modules():
+        if isinstance(module, WQLinear_GEMM):
+            handles.append(module.register_forward_hook(lambda _m, _i, _o, n=name: hits.add(n)))
 
     inputs = processor(
         text=[f"Speaker 1: {args.text}"],
@@ -62,23 +72,25 @@ def main():
             verbose=False,
         )
     generation_seconds = time.perf_counter() - generation_start
+    for handle in handles:
+        handle.remove()
+    if len(hits) != 196:
+        raise RuntimeError(f"Only {len(hits)}/196 AWQ modules executed")
     if not output.speech_outputs or output.speech_outputs[0] is None:
-        raise RuntimeError("GPTQ smoke test produced no audio")
+        raise RuntimeError("AWQ smoke test produced no audio")
 
     audio = output.speech_outputs[0].squeeze().float().cpu().numpy()
     if not np.isfinite(audio).all():
-        raise RuntimeError("GPTQ smoke test produced NaN or Inf audio")
+        raise RuntimeError("AWQ smoke test produced NaN or Inf audio")
     rms = float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
     peak = float(np.max(np.abs(audio)))
     if rms < 1e-5 or peak < 1e-4:
-        raise RuntimeError(f"GPTQ smoke test produced silence: RMS={rms}, peak={peak}")
+        raise RuntimeError(f"AWQ smoke test produced silence: RMS={rms}, peak={peak}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     sf.write(args.output, audio, 24000)
     duration = len(audio) / 24000
-    packed = sum(
-        hasattr(module, "qweight") for module in model.model.language_model.modules()
-    )
     tts_peak_vram = torch.cuda.max_memory_allocated() / 1024**3
+
     del model, output
     torch.cuda.empty_cache()
     asr = whisper.load_model("large-v3", device="cuda")
@@ -93,13 +105,14 @@ def main():
     wer = float(jiwer.wer(args.text.lower(), transcript.lower()))
     if wer > args.max_wer:
         raise RuntimeError(
-            f"GPTQ smoke WER {wer:.3f} exceeds {args.max_wer:.3f}: {transcript!r}"
+            f"AWQ smoke WER {wer:.3f} exceeds {args.max_wer:.3f}: {transcript!r}"
         )
 
     metrics = {
         "model": str(args.model.resolve()),
         "audio": str(args.output.resolve()),
-        "gptq_modules": packed,
+        "awq_modules": len(hits),
+        "backend": "AutoAWQ GEMM/Triton",
         "load_seconds": load_seconds,
         "generation_seconds": generation_seconds,
         "audio_seconds": duration,
@@ -110,8 +123,6 @@ def main():
         "rtf": generation_seconds / duration,
         "vram_peak_gib": tts_peak_vram,
     }
-    if packed != 196:
-        raise RuntimeError(f"Expected 196 GPTQ modules, found {packed}")
     metrics_path = args.output.with_suffix(".json")
     metrics_path.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
     manifest_path = args.model / "manifest.json"

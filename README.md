@@ -17,7 +17,7 @@ Este proyecto constituye el marco experimental de una tesis que evalua tres tecn
 | **Sprint 2** | GGUF IQ4_NL selectivo + runtime C++ CrispASR | Implementado, espera checkpoint corregido |
 | **Sprint 2.5** | Analisis de arquitectura y diagnostico de fallos | Completado |
 | **Sprint 3** | GPTQ W4 g128 selectivo con loader hibrido Triton | Implementado, espera checkpoint corregido |
-| **Sprint 4** | AWQ via AutoAWQ (vibevoice nativo) | Completado |
+| **Sprint 4** | AWQ W4A16 g128 selectivo con AutoAWQ/Triton | Implementado, espera checkpoint corregido |
 | **Sprint 5** | INT8 selectiva (Fabio Sarracino + HelpfulHand3) | Pendiente |
 | **Sprint 6** | NF4 + double quant (DevParker/Dubedo + Soniqo) | Implementado, benchmark pendiente |
 | **Sprint 7** | FP8 E4M3FN dinamico (Zhao-Kun + CyberVoice) | Implementado, benchmark pendiente |
@@ -59,7 +59,7 @@ Ver [`docs/quantization_architecture_analysis.md`](docs/quantization_architectur
 | PEFT | 0.19.1 | Adaptadores LoRA |
 | bitsandbytes | 0.49.2 | Cuantizacion RTN/NF4 |
 | GPTQModel | 2.2.0 | GPTQ W4 g128 selectivo con backend Triton |
-| llmcompressor (NM) | — | AWQ via Neural Magic |
+| AutoAWQ | 0.2.9 | AWQ W4A16 GEMM selectivo con backend Triton |
 | Numba | 0.65.1 | Tokenizador acustico continuo |
 | Datasets | 3.5.0 | Carga de Common Voice 17.0 |
 | librosa | 0.11.0 | Remuestreo y preprocesamiento de audio |
@@ -83,7 +83,11 @@ VibeVoice_Optimization/
 │   ├── smoke_vibevoice_iq4_nl.sh        # Inferencia nativa C++
 │   ├── build_vibevoice_gptq.sh           # GPTQ W4 selectivo y persistente
 │   ├── gptq_vibevoice.py                 # Export, validacion y loader hibrido
-│   └── smoke_vibevoice_gptq.py           # Recarga limpia y smoke TTS GPTQ
+│   ├── smoke_vibevoice_gptq.py           # Recarga limpia y smoke TTS GPTQ
+│   ├── setup_autoawq.sh                   # Preflight AutoAWQ 0.2.9 + Triton
+│   ├── build_vibevoice_awq.sh             # AWQ W4A16 selectivo y persistente
+│   ├── awq_vibevoice.py                   # Export, validacion y loader hibrido
+│   └── smoke_vibevoice_awq.py             # Recarga limpia, TTS y gate WER AWQ
 ├── VibeVoice_repo/                      # Codigo fuente del fork comunitario
 │   ├── vibevoice/modular/               # Definicion de arquitectura (.py)
 │   ├── vibevoice/finetune/              # Scripts de entrenamiento
@@ -133,11 +137,21 @@ python scripts/smoke_vibevoice_gptq.py \
   --output outputs/sprint3_gptq/smoke-es.wav
 ```
 
+Sprint 4 usa AutoAWQ 0.2.9 en el entorno `vibevoice`. Cuantiza exclusivamente las 196 proyecciones Qwen como W4A16 asimetrico g128 GEMM y conserva el pipeline acustico en FP16. El artefacto se acepta solo despues de la validacion estructural y un smoke TTS en proceso limpio:
+
+```bash
+bash scripts/setup_autoawq.sh
+bash scripts/build_vibevoice_awq.sh
+python scripts/smoke_vibevoice_awq.py \
+  --model weights/vibevoice-1.5b-es-awq \
+  --output outputs/sprint4_awq/smoke-es.wav
+```
+
 ### 3. Pipeline de cuantizacion — Sprints 1 al 7
 
 Ejecutar `notebooks/tesis_model_cuantization.ipynb` secuencialmente. Los scripts de shell se ejecutan desde terminal.
 
-### Resultados actuales (Sprints 1-3):
+### Resultados actuales (Sprints 1-4):
 
 | Sprint | Modelo | WER | PPL |
 |--------|--------|-----|-----|
@@ -145,6 +159,7 @@ Ejecutar `notebooks/tesis_model_cuantization.ipynb` secuencialmente. Los scripts
 | Sprint 1.5 | VibeVoice-ES (fine-tuned) | — | — |
 | Sprint 2 | GGUF IQ4_NL selectivo | Pendiente | — |
 | Sprint 3 | GPTQ W4 g128 selectivo | Pendiente | — |
+| Sprint 4 | AWQ W4A16 g128 selectivo | Pendiente | — |
 
 **Precaucion:** antes de cualquier import del modelo, aplicar el parche obligatorio de `CONFIG_MAPPING` (colision de nombres en `transformers>=4.45.x`):
 
@@ -161,11 +176,12 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 - **Flash Attention:** NO instalado. Compilar `flash-attn` desde fuente satura la RAM de WSL2. Se usa PyTorch SDPA nativa con `attn_implementation="sdpa"`.
 - **LoRA de adaptacion linguistica (Sprint 1.5):** Fine-tuning pre-cuantizacion sobre datos en espanol; sus pesos se mergean al modelo base. Es el unico LoRA del proyecto: el LoRA de compensacion post-AWQ (Sprint 4) se descarto porque peft no admite adaptadores sobre las capas `WQLinear` de AutoAWQ.
 - **Dataset:** `fsicoli/common_voice_17_0` (config `"es"`), mirror comunitario del dataset original de Mozilla (retirado Oct 2025). Audio original a 48kHz → remuestreo a 24kHz + normalizacion a -25 dB FS.
-- **Set de calibracion:** 512 muestras del split `validation`, concatenadas en `data/calibration_tensor.pt` (285 MB, `float32`), requerido por GPTQ y AWQ para recolectar estadisticas de activacion.
+- **Set de calibracion:** 512 muestras reservadas del split `validation`. GPTQ y AWQ consumen sus transcripciones auditadas desde `data/calibration_metadata.json`; `data/calibration_tensor.pt` conserva el audio preprocesado para tecnicas que requieran activaciones acusticas.
 - **Cuantizabilidad:** Arquitectura confirmada compatible con GPTQ/AWQ. Todas las capas proyectivas son `nn.Linear` estandar. Los tokenizers convolucionales (~35% params) se preservan en FP16. VRAM esperada post-cuantizacion: ~2.5-3.5 GB.
 - **IQ4_NL usa un runtime distinto:** Sprint 2 produce un GGUF monolitico para CrispASR. No es compatible con llama.cpp, `ggc v6` ni con el loader Hugging Face del resto de variantes.
 - **Cota fisica de IQ4_NL:** proteger 1.394B parametros no-Qwen en F16 requiere al menos 2.596 GiB. Con las 196 matrices Qwen en IQ4_NL, el payload minimo es ~3.28 GiB; una huella total menor a 1.2 GB no es compatible con esta estrategia.
 - **GPTQ requiere un loader hibrido:** las matrices empaquetadas (`qweight`, `qzeros`, `scales`, `g_idx`) no pueden copiarse a `nn.Linear` mediante `state_dict`. Sprint 3 carga el decoder con GPTQModel/Triton y trasplanta el objeto `Qwen2Model`; los modulos TTS protegidos se cargan por separado en BF16.
+- **AWQ usa GEMM/Triton, no Marlin:** AutoAWQ 0.2.9 produce 196 modulos `WQLinear_GEMM` W4A16 asimetricos. `awq_ext` no esta instalado en este host; etiquetar este artefacto como Marlin seria incorrecto.
 - **Conv1D debe permanecer en FP16/FP32:** Cuantizar capas convolucionales de tokenizers corrompe las salidas acusticas (hallazgo Mudler/LocalAI). Refuerza exclusion de `acoustic_tokenizer` y `semantic_tokenizer`.
 - **AdaLN del diffusion head es fragil bajo INT4:** Los bloques Adaptive Layer Normalization fallan bajo ciertos esquemas INT4 (hallazgo FluffyBunnies/ONNX). Considerar FP16 o FP8 para diffusion head.
 - **DPM-Solver sensible a INT:** El desnatador de ruido del diffusion head genera "voz metalica" bajo cuantizacion entera. FP8 lo elimina al mantener exponentes flotantes (CyberVoice Labs).
@@ -179,7 +195,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 | **FP16** ($O_1$) | Linea base sin compresion | — | 5.04 GB VRAM, RTF=1.35, WER=0.54 |
 | **IQ4_NL** ($X_1$) | LUT no lineal selectiva, Qwen-only | CrispASR/GGML | Implementado; benchmark pendiente |
 | **GPTQ** ($X_2$) | Reconstruccion Hessiana W4 g128, Qwen-only | GPTQModel/Triton | Implementado; benchmark corregido pendiente |
-| **AWQ** ($X_3$) | Proteccion de canales por activaciones | AutoAWQ | Completado (Sprint 4) |
+| **AWQ** ($X_3$) | Proteccion de canales W4A16 g128, Qwen-only | AutoAWQ/Triton | Implementado; benchmark corregido pendiente |
 | **INT8** | Selectiva LLM-only | bitsandbytes | Pendiente (Sprint 5) |
 | **NF4** | NormalFloat4 + double quant selectivo | bitsandbytes | Implementado; 3.25 GB VRAM de reposo, benchmark pendiente |
 | **FP8** | E4M3FN dinamico, salida BF16 | torch._scaled_mm | Implementado; 3.89 GB VRAM tras recarga, benchmark pendiente |

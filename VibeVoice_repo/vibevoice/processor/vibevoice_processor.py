@@ -95,6 +95,10 @@ class VibeVoiceProcessor:
         
         # Load tokenizer - try from model path first, then fallback to Qwen        
         language_model_pretrained_name = config.get("language_model_pretrained_name", None) or kwargs.pop("language_model_pretrained_name", "Qwen/Qwen2.5-1.5B")
+        if os.path.isdir(pretrained_model_name_or_path) and not os.path.isabs(language_model_pretrained_name):
+            local_tokenizer = os.path.join(pretrained_model_name_or_path, language_model_pretrained_name)
+            if os.path.isdir(local_tokenizer):
+                language_model_pretrained_name = local_tokenizer
         logger.info(f"Loading tokenizer from {language_model_pretrained_name}")
         if 'qwen' in language_model_pretrained_name.lower():
             tokenizer = VibeVoiceTextTokenizerFast.from_pretrained(
@@ -143,6 +147,7 @@ class VibeVoiceProcessor:
         # Save processor configuration
         processor_config = {
             "processor_class": "VibeVoiceProcessor",
+            "language_model_pretrained_name": "tokenizer",
             "speech_tok_compress_ratio": self.speech_tok_compress_ratio,
             "db_normalize": self.db_normalize,
             "audio_processor": {
@@ -157,6 +162,8 @@ class VibeVoiceProcessor:
         config_path = os.path.join(save_directory, "preprocessor_config.json")
         with open(config_path, 'w') as f:
             json.dump(processor_config, f, indent=2)
+
+        self.tokenizer.save_pretrained(os.path.join(save_directory, "tokenizer"))
         
         logger.info(f"Processor configuration saved in {config_path}")
     

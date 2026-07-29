@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""Build, validate, and load a selective GPTQ VibeVoice checkpoint."""
+# ruff: noqa: E402
+"""Build, validate, and load a selective AutoAWQ VibeVoice checkpoint."""
 
 from __future__ import annotations
 
 import argparse
 import gc
 import hashlib
+import importlib.util
 import json
-import os
-import re
 import shutil
 import sys
-from collections import Counter
 from pathlib import Path
 
 import torch
@@ -32,23 +31,17 @@ if hasattr(transformers, "CONFIG_MAPPING"):
     if hasattr(transformers.CONFIG_MAPPING, "_mapping"):
         transformers.CONFIG_MAPPING._mapping.pop("vibevoice_acoustic_tokenizer", None)
 
-from gptqmodel import GPTQModel, QuantizeConfig
-from gptqmodel.quantization.config import FORMAT
-from gptqmodel.utils.backend import BACKEND
-from transformers import Qwen2Config, Qwen2ForCausalLM
+from awq import AutoAWQForCausalLM
+from awq.modules.linear.gemm import WQLinear_GEMM
+from transformers import AutoTokenizer, Qwen2Config, Qwen2ForCausalLM
 
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 
 
-TARGET_RE = re.compile(
-    r"^model\.layers\.(\d+)\."
-    r"(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|"
-    r"mlp\.(?:gate_proj|up_proj|down_proj))$"
-)
-PACKED_SUFFIXES = ("qweight", "qzeros", "scales", "g_idx")
-SCHEMA = "vibevoice-selective-gptq-v1"
+PACKED_SUFFIXES = ("qweight", "qzeros", "scales")
+SCHEMA = "vibevoice-selective-awq-v1"
 
 
 def expected_targets() -> set[str]:
@@ -106,39 +99,35 @@ def source_hashes(path: Path) -> dict[str, str]:
     return {file.name: sha256(file) for file in files}
 
 
-def build_calibration(tokenizer, metadata_path: Path, output_path: Path, sequence_length: int = 256):
-    with metadata_path.open(encoding="utf-8") as stream:
-        metadata = json.load(stream)
+def build_calibration(tokenizer, metadata_path: Path, output_path: Path):
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     if metadata.get("split_origin") != "validation":
-        raise ValueError("GPTQ calibration must use the reserved validation split")
-
-    token_ids: list[int] = []
+        raise ValueError("AWQ calibration must use the reserved validation split")
     records = metadata["records"]
-    eos = tokenizer.eos_token_id
-    for record in records:
-        text = f"Speaker 1: {record['sentence'].strip()}\n"
-        token_ids.extend(tokenizer(text, add_special_tokens=False)["input_ids"])
-        if eos is not None:
-            token_ids.append(eos)
-
-    samples = []
-    for start in range(0, len(token_ids), sequence_length):
-        ids = token_ids[start : start + sequence_length]
-        if len(ids) < sequence_length // 2:
-            break
-        samples.append({"input_ids": ids, "attention_mask": [1] * len(ids)})
-    if len(samples) < 16:
-        raise ValueError(f"Insufficient calibration coverage: {len(samples)} chunks")
-
+    if len(records) != 512:
+        raise ValueError(f"AWQ calibration requires exactly 512 reserved records, found {len(records)}")
+    local_indices = [record["local_idx"] for record in records]
+    if len(set(local_indices)) != len(local_indices):
+        raise ValueError("AWQ calibration contains duplicate source indices")
+    groups = [[] for _ in range(128)]
+    indices = [[] for _ in range(128)]
+    for position, record in enumerate(records):
+        group = position % len(groups)
+        groups[group].append(f"Speaker 1: {record['sentence'].strip()}")
+        indices[group].append(record["local_idx"])
+    texts = ["\n".join(group) for group in groups if group]
+    lengths = [len(tokenizer(text, add_special_tokens=False)["input_ids"]) for text in texts]
+    if len(texts) != 128 or max(lengths) > 512:
+        raise ValueError(f"Invalid AWQ calibration shape: samples={len(texts)}, max_tokens={max(lengths)}")
     report = {
         "dataset_id": metadata["dataset_id"],
         "dataset_config": metadata["dataset_config"],
         "split_origin": metadata["split_origin"],
         "source_records": len(records),
-        "sequence_length": sequence_length,
-        "chunks": len(samples),
-        "total_tokens": sum(len(item["input_ids"]) for item in samples),
-        "samples": samples,
+        "samples": len(texts),
+        "token_lengths": lengths,
+        "source_indices": indices,
+        "texts": texts,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(report, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -155,7 +144,7 @@ def prepare(source: Path, output: Path, metadata: Path, force: bool) -> None:
             raise FileExistsError(f"Output exists: {output}; pass --force to rebuild")
         shutil.rmtree(output)
 
-    work = output / ".work" / "decoder-bf16"
+    work = output / ".work" / "decoder-fp16"
     protected_dir = output / "protected"
     calibration_dir = output / "calibration"
     work.mkdir(parents=True)
@@ -172,10 +161,10 @@ def prepare(source: Path, output: Path, metadata: Path, force: bool) -> None:
     for name, tensor in iter_tensors(source):
         if name.startswith("model.language_model."):
             mapped = name.removeprefix("model.language_model.")
-            qwen_state[mapped] = tensor.to(torch.bfloat16) if tensor.is_floating_point() else tensor
+            qwen_state[mapped] = tensor.to(torch.float16) if tensor.is_floating_point() else tensor
         elif name != "lm_head.weight":
             protected_state[name] = (
-                tensor.to(torch.bfloat16) if tensor.is_floating_point() and tensor.ndim > 0 else tensor
+                tensor.to(torch.float16) if tensor.is_floating_point() and tensor.ndim > 0 else tensor
             )
 
     with init_empty_weights():
@@ -184,7 +173,8 @@ def prepare(source: Path, output: Path, metadata: Path, force: bool) -> None:
     if missing or unexpected:
         raise RuntimeError(f"Qwen extraction mismatch: missing={missing}, unexpected={unexpected}")
     qwen.lm_head.weight = qwen.model.embed_tokens.weight
-    qwen.config.torch_dtype = torch.bfloat16
+    qwen.config.torch_dtype = torch.float16
+    qwen.config.use_cache = False
     qwen.save_pretrained(work, safe_serialization=True, max_shard_size="4GB")
     del qwen, qwen_state
     gc.collect()
@@ -200,7 +190,6 @@ def prepare(source: Path, output: Path, metadata: Path, force: bool) -> None:
         processor.tokenizer, metadata, calibration_dir / "samples.json"
     )
     del processor
-
     for filename in ("config.json", "generation_config.json"):
         src = source / filename
         if src.is_file():
@@ -211,72 +200,102 @@ def prepare(source: Path, output: Path, metadata: Path, force: bool) -> None:
         "status": "prepared",
         "source": str(source.resolve()),
         "source_hashes": source_hashes(source),
-        "dtype_policy": "audio/connectors/prediction_head BF16; Qwen projections GPTQ W4",
-        "gptq": {
+        "dtype_policy": "audio/connectors/prediction_head FP16; Qwen projections AWQ W4A16",
+        "awq": {
             "bits": 4,
             "group_size": 128,
-            "sym": True,
-            "desc_act": False,
-            "damp_percent": 0.1,
-            "format": "gptq",
-            "backend": "triton",
+            "zero_point": True,
+            "version": "gemm",
+            "runtime": "triton",
             "expected_modules": 196,
+            "duo_scaling": True,
+            "apply_clip": True,
         },
-        "calibration": {key: value for key, value in calibration.items() if key != "samples"},
+        "calibration": {
+            "dataset_id": calibration["dataset_id"],
+            "split_origin": calibration["split_origin"],
+            "source_records": calibration["source_records"],
+            "samples": calibration["samples"],
+            "min_tokens": min(calibration["token_lengths"]),
+            "max_tokens": max(calibration["token_lengths"]),
+        },
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    print(f"Prepared BF16 decoder and protected VibeVoice modules in {output}")
+    print(f"Prepared FP16 decoder and protected VibeVoice modules in {output}")
 
 
 def quantize(output: Path) -> None:
-    work = output / ".work" / "decoder-bf16"
-    decoder = output / "decoder-gptq"
+    work = output / ".work" / "decoder-fp16"
+    decoder = output / "decoder-awq"
     calibration_path = output / "calibration" / "samples.json"
     if not work.is_dir() or not calibration_path.is_file():
         raise FileNotFoundError("Run prepare before quantize")
-    calibration = json.loads(calibration_path.read_text(encoding="utf-8"))["samples"]
-
-    quant_config = QuantizeConfig(
-        bits=4,
-        group_size=128,
-        sym=True,
-        desc_act=False,
-        damp_percent=0.1,
-        true_sequential=True,
-        lm_head=False,
-        format=FORMAT.GPTQ,
-        device="cuda:0",
+    calibration = json.loads(calibration_path.read_text(encoding="utf-8"))["texts"]
+    tokenizer = AutoTokenizer.from_pretrained(work, local_files_only=True)
+    model = AutoAWQForCausalLM.from_pretrained(
+        work,
+        safetensors=True,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        use_cache=False,
     )
-    model = GPTQModel.load(work, quantize_config=quant_config)
+    quant_config = {
+        "zero_point": True,
+        "q_group_size": 128,
+        "w_bit": 4,
+        "version": "GEMM",
+        "modules_to_not_convert": ["lm_head"],
+    }
     model.quantize(
-        calibration,
-        batch_size=1,
-        backend=BACKEND.TRITON,
-        calibration_enable_gpu_cache=False,
-        buffered_fwd=True,
-        auto_gc=True,
+        tokenizer,
+        quant_config=quant_config,
+        calib_data=calibration,
+        max_calib_samples=128,
+        max_calib_seq_len=512,
+        n_parallel_calib_samples=1,
+        max_chunk_memory=512 * 1024 * 1024,
+        duo_scaling=True,
+        apply_clip=True,
     )
-    model.save(decoder, max_shard_size="4GB")
+    model.model.config.torch_dtype = torch.float16
+    model.model.config.use_cache = True
+    model.save_quantized(decoder, shard_size="4GB")
+    tokenizer.save_pretrained(decoder)
     del model
     gc.collect()
     torch.cuda.empty_cache()
-    print(f"GPTQ decoder saved in {decoder}")
+    print(f"AWQ decoder saved in {decoder}")
 
 
 def tensor_inventory(path: Path) -> dict[str, tuple[tuple[int, ...], str]]:
-    inventory = {}
-    for name, tensor in iter_tensors(path):
-        inventory[name] = (tuple(tensor.shape), str(tensor.dtype))
-    return inventory
+    return {
+        name: (tuple(tensor.shape), str(tensor.dtype))
+        for name, tensor in iter_tensors(path)
+    }
 
 
 def validate(output: Path, remove_work: bool = False) -> dict:
     manifest_path = output / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("schema") != SCHEMA:
-        raise ValueError("Unsupported or legacy GPTQ artifact")
+        raise ValueError("Unsupported or legacy AWQ artifact")
+    if manifest.get("status") not in {"prepared", "structure_validated", "validated"}:
+        raise ValueError(f"Invalid AWQ artifact status: {manifest.get('status')!r}")
 
-    decoder_inventory = tensor_inventory(output / "decoder-gptq")
+    decoder_config = json.loads((output / "decoder-awq" / "config.json").read_text(encoding="utf-8"))
+    quant_config = decoder_config.get("quantization_config", {})
+    expected_config = {
+        "bits": 4,
+        "group_size": 128,
+        "quant_method": "awq",
+        "version": "gemm",
+        "zero_point": True,
+    }
+    for key, expected_value in expected_config.items():
+        if quant_config.get(key) != expected_value:
+            raise AssertionError(f"Invalid AWQ config {key}: {quant_config.get(key)!r}")
+
+    decoder_inventory = tensor_inventory(output / "decoder-awq")
     packed = {suffix: set() for suffix in PACKED_SUFFIXES}
     for name in decoder_inventory:
         for suffix in PACKED_SUFFIXES:
@@ -287,11 +306,20 @@ def validate(output: Path, remove_work: bool = False) -> dict:
     for suffix, names in packed.items():
         if names != expected:
             raise AssertionError(
-                f"Invalid {suffix} target set: missing={sorted(expected - names)[:5]}, "
+                f"Invalid {suffix} targets: missing={sorted(expected - names)[:5]}, "
                 f"unexpected={sorted(names - expected)[:5]}"
             )
+    for target in expected:
+        if f"{target}.weight" in decoder_inventory:
+            raise AssertionError(f"Dense target remains in AWQ decoder: {target}")
+        if decoder_inventory[f"{target}.qweight"][1] != "torch.int32":
+            raise AssertionError(f"qweight is not INT32: {target}")
+        if decoder_inventory[f"{target}.qzeros"][1] != "torch.int32":
+            raise AssertionError(f"qzeros is not INT32: {target}")
+        if decoder_inventory[f"{target}.scales"][1] != "torch.float16":
+            raise AssertionError(f"scales are not FP16: {target}")
     if any("acoustic" in name or "semantic" in name or "prediction_head" in name for name in decoder_inventory):
-        raise AssertionError("Audio tensor found inside GPTQ decoder")
+        raise AssertionError("Audio tensor found inside AWQ decoder")
 
     protected_inventory = tensor_inventory(output / "protected")
     if any(name.startswith("model.language_model.") or name == "lm_head.weight" for name in protected_inventory):
@@ -307,21 +335,19 @@ def validate(output: Path, remove_work: bool = False) -> dict:
         if not any(name.startswith(prefix) for name in protected_inventory):
             raise AssertionError(f"Missing protected component: {prefix}")
     with safe_open(output / "protected" / "model.safetensors", framework="pt", device="cpu") as handle:
-        for buffer_name in ("model.speech_scaling_factor", "model.speech_bias_factor"):
-            if buffer_name not in protected_inventory:
-                raise AssertionError(f"Missing protected buffer: {buffer_name}")
-            if not torch.isfinite(handle.get_tensor(buffer_name)).all():
-                raise AssertionError(f"Non-finite protected buffer: {buffer_name}")
+        for name in ("model.speech_scaling_factor", "model.speech_bias_factor"):
+            if name not in protected_inventory or not torch.isfinite(handle.get_tensor(name)).all():
+                raise AssertionError(f"Missing or non-finite protected buffer: {name}")
     invalid_dtype = [
         (name, dtype)
         for name, (_, dtype) in protected_inventory.items()
-        if dtype.startswith("torch.float") and dtype not in {"torch.bfloat16", "torch.float32"}
+        if dtype.startswith("torch.float") and dtype not in {"torch.float16", "torch.float32"}
     ]
     if invalid_dtype:
-        raise AssertionError(f"Unexpected protected dtypes: {invalid_dtype[:5]}")
+        raise AssertionError(f"Protected modules are not FP16: {invalid_dtype[:5]}")
 
     files = [
-        *[file for file in (output / "decoder-gptq").rglob("*") if file.is_file()],
+        *[file for file in (output / "decoder-awq").rglob("*") if file.is_file()],
         *(output / "protected").glob("*.safetensors"),
         *[
             file
@@ -336,7 +362,7 @@ def validate(output: Path, remove_work: bool = False) -> dict:
         for file in sorted(files)
     }
     current_validation = {
-        "gptq_modules": len(packed["qweight"]),
+        "awq_modules": len(packed["qweight"]),
         "protected_tensors": len(protected_inventory),
         "total_bytes": sum(file.stat().st_size for file in files),
     }
@@ -356,28 +382,29 @@ def validate(output: Path, remove_work: bool = False) -> dict:
     return manifest
 
 
-def load_gptq_vibevoice(
+def load_awq_vibevoice(
     artifact: str | Path,
     device: str = "cuda:0",
-    backend: str = "triton",
 ) -> VibeVoiceForConditionalGenerationInference:
     artifact = Path(artifact)
     validate(artifact)
-    selected_backend = {"triton": BACKEND.TRITON, "torch": BACKEND.TORCH}[backend]
-    decoder_wrapper = GPTQModel.load(
-        artifact / "decoder-gptq",
-        device=device,
-        backend=selected_backend,
+    if importlib.util.find_spec("awq_ext") is not None:
+        raise RuntimeError("This artifact is validated for AutoAWQ Triton, not awq_ext")
+    decoder_wrapper = AutoAWQForCausalLM.from_quantized(
+        artifact / "decoder-awq",
+        device_map={"": device},
+        torch_dtype=torch.float16,
+        safetensors=True,
+        fuse_layers=False,
+        use_exllama=False,
+        use_exllama_v2=False,
     )
     decoder = decoder_wrapper.model.model
 
     config = VibeVoiceConfig.from_pretrained(artifact)
-    # Keep deterministic/non-persistent buffers materialized; only parameters
-    # belong on meta because those buffers are not present in safetensors.
     with init_empty_weights(include_buffers=False):
         model = VibeVoiceForConditionalGenerationInference(config)
     model.model.language_model = decoder
-
     protected = load_file(artifact / "protected" / "model.safetensors", device="cpu")
     missing, unexpected = model.load_state_dict(protected, strict=False, assign=True)
     if unexpected:
@@ -402,17 +429,15 @@ def load_gptq_vibevoice(
         module.to(device)
     model.model.speech_scaling_factor = model.model.speech_scaling_factor.to(device)
     model.model.speech_bias_factor = model.model.speech_bias_factor.to(device)
-
     meta = [name for name, tensor in list(model.named_parameters()) + list(model.named_buffers()) if tensor.is_meta]
     if meta:
-        raise RuntimeError(f"Unmaterialized tensors after hybrid load: {meta[:10]}")
-    packed_modules = [name for name, module in model.model.language_model.named_modules() if hasattr(module, "qweight")]
-    if len(packed_modules) != 196:
-        raise RuntimeError(f"Expected 196 GPTQ modules after reload, found {len(packed_modules)}")
+        raise RuntimeError(f"Unmaterialized tensors after AWQ load: {meta[:10]}")
+    modules = [module for module in model.model.language_model.modules() if isinstance(module, WQLinear_GEMM)]
+    if len(modules) != 196:
+        raise RuntimeError(f"Expected 196 WQLinear_GEMM modules, found {len(modules)}")
     if model.lm_head.weight.data_ptr() != model.model.language_model.embed_tokens.weight.data_ptr():
         raise RuntimeError("lm_head and embed_tokens are not tied")
-
-    object.__setattr__(model, "_gptq_decoder_wrapper", decoder_wrapper)
+    object.__setattr__(model, "_awq_decoder_wrapper", decoder_wrapper)
     model.eval()
     model.set_ddpm_inference_steps(num_steps=20)
     return model
@@ -421,16 +446,13 @@ def load_gptq_vibevoice(
 def parse_args():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
-
     prepare_parser = subparsers.add_parser("prepare")
     prepare_parser.add_argument("--source", type=Path, required=True)
     prepare_parser.add_argument("--output", type=Path, required=True)
     prepare_parser.add_argument("--metadata", type=Path, required=True)
     prepare_parser.add_argument("--force", action="store_true")
-
     quantize_parser = subparsers.add_parser("quantize")
     quantize_parser.add_argument("--output", type=Path, required=True)
-
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("--output", type=Path, required=True)
     validate_parser.add_argument("--remove-work", action="store_true")

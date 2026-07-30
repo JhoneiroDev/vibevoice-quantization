@@ -149,7 +149,9 @@ python scripts/smoke_vibevoice_awq.py \
 
 ### 3. Pipeline de cuantizacion — Sprints 1 al 7
 
-Ejecutar `notebooks/tesis_model_cuantization.ipynb` secuencialmente. Los scripts de shell se ejecutan desde terminal.
+Ejecutar `notebooks/tesis_model_cuantization.ipynb` secuencialmente. Las celdas correspondientes invocan los scripts de shell en el orden requerido.
+
+Las celdas largas desde `S1.5-03` se ejecutan como jobs desacoplados del kernel. Cada job conserva PID, estado y log en `outputs/.notebook-jobs/<job>/`; si VS Code se desconecta, vuelva a abrir el notebook y reejecute la misma celda para reconectarse. El entrenamiento guarda cada 500 pasos y reanuda automaticamente desde el ultimo `checkpoint-*` despues de una caida completa de WSL.
 
 ### Resultados actuales (Sprints 1-4):
 

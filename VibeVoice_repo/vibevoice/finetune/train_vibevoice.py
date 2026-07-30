@@ -318,6 +318,20 @@ def main() -> None:
     tm_lower = [s.strip().lower() for s in model_args.lora_target_modules.split(",") if s.strip()]
     skip_lm_lora = (len(tm_lower) == 0) or all(t in ("none", "off", "disable", "disabled") for t in tm_lower)
     if not skip_lm_lora:
+        language_model = model.model.language_model
+        if getattr(language_model, "is_quantized", False) or any(
+            hasattr(module, "qweight") for module in language_model.modules()
+        ):
+            raise ValueError("Sprint 1.5 requires a dense language model before applying LoRA")
+
+        # PEFT 0.19.1 probes every quantized dispatcher and raises when the
+        # Sprint 3 GPTQModel 2.2.0 package is present, even for dense nn.Linear.
+        from peft.tuners.lora import awq as peft_lora_awq
+        from peft.tuners.lora import gptq as peft_lora_gptq
+
+        peft_lora_awq.is_gptqmodel_available = lambda: False
+        peft_lora_gptq.is_gptqmodel_available = lambda: False
+        logger.info("Disabled PEFT AWQ/GPTQ dispatchers for dense Sprint 1.5 LoRA training.")
         model.model.language_model = get_peft_model(model.model.language_model, lora_cfg)
     else:
         logger.info("Skipping LLM LoRA wrapping (lora_target_modules indicates none).")

@@ -24,8 +24,15 @@ echo "Val JSONL   : $VAL_JSONL"
 echo "Output      : $OUTPUT_DIR"
 echo ""
 
+RESUME_ARGS=()
+LATEST_CHECKPOINT=$(find "$OUTPUT_DIR" -maxdepth 1 -type d -name 'checkpoint-*' -print 2>/dev/null | sort -V | tail -n 1)
+if [[ -n "$LATEST_CHECKPOINT" ]]; then
+    echo "Reanudando desde: $LATEST_CHECKPOINT"
+    RESUME_ARGS=(--resume_from_checkpoint "$LATEST_CHECKPOINT")
+fi
+
 # Limpiar cache CUDA antes de empezar
-$PYTHON_BIN -c "import torch; torch.cuda.empty_cache(); print(f'VRAM libre: {torch.cuda.memory_allocated()/1024**3:.2f} GB')"
+$PYTHON_BIN -c "import torch; torch.cuda.empty_cache(); free, total = torch.cuda.mem_get_info(); print(f'VRAM disponible: {free/1024**3:.2f}/{total/1024**3:.2f} GB')"
 
 $PYTHON_BIN -m vibevoice.finetune.train_vibevoice \
     --model_name_or_path "$MODEL_PATH" \
@@ -44,7 +51,7 @@ $PYTHON_BIN -m vibevoice.finetune.train_vibevoice \
     --logging_steps 50 \
     --eval_strategy steps \
     --save_strategy steps \
-    --save_steps 1000 \
+    --save_steps 500 \
     --eval_steps 1000 \
     --save_total_limit 2 \
     --prediction_loss_only True \
@@ -68,7 +75,8 @@ $PYTHON_BIN -m vibevoice.finetune.train_vibevoice \
     --lora_target_modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
     --max_grad_norm 0.8 \
     --gradient_clipping \
-    --seed 42
+    --seed 42 \
+    "${RESUME_ARGS[@]}"
 
 echo ""
 echo "[S1.5-03] Fine-tuning completado"

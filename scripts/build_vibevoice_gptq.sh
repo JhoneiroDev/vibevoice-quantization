@@ -9,7 +9,7 @@ METADATA=${3:-"$ROOT/data/calibration_metadata.json"}
 
 echo "[S3-02] GPTQ W4 g128 selectivo sobre Qwen2"
 "$PYTHON_BIN" "$ROOT/scripts/gptq_vibevoice.py" prepare \
-    --source "$SOURCE" --output "$OUTPUT" --metadata "$METADATA" --force
+    --source "$SOURCE" --output "$OUTPUT" --metadata "$METADATA"
 "$PYTHON_BIN" "$ROOT/scripts/gptq_vibevoice.py" quantize --output "$OUTPUT"
 "$PYTHON_BIN" "$ROOT/scripts/gptq_vibevoice.py" validate --output "$OUTPUT" --remove-work
 echo "Modelo GPTQ guardado y validado estructuralmente: $OUTPUT"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Persistent Spanish TTS quality gate for the corrected VibeVoice checkpoint."""
+"""Persistent Spanish TTS quality gate for a VibeVoice checkpoint."""
 
 from __future__ import annotations
 
@@ -67,6 +67,9 @@ def main() -> None:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--max-wer", type=float, default=0.30)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--voice-sample", type=Path)
+    parser.add_argument("--asr-device", choices=["cpu", "cuda"], default="cpu")
     args = parser.parse_args()
 
     model_path = args.model.resolve()
@@ -74,7 +77,7 @@ def main() -> None:
     config = model_path / "config.json"
     weights = sorted(model_path.glob("*.safetensors"))
     if not config.is_file() or not weights:
-        raise FileNotFoundError(f"Incomplete corrected checkpoint: {model_path}")
+        raise FileNotFoundError(f"Incomplete VibeVoice checkpoint: {model_path}")
     source_hashes = {path.name: sha256(path) for path in [config, *weights]}
     output.mkdir(parents=True, exist_ok=True)
 
@@ -88,14 +91,18 @@ def main() -> None:
     )
     model.eval()
     model.set_ddpm_inference_steps(num_steps=20)
+    voice_sample = args.voice_sample.resolve() if args.voice_sample is not None else None
+    if voice_sample is not None and not voice_sample.is_file():
+        raise FileNotFoundError(f"Missing voice sample: {voice_sample}")
     processor = VibeVoiceProcessor.from_pretrained(model_path, local_files_only=True)
     rtfs = []
     peak_vram = torch.cuda.memory_allocated() / 1024**3
     wav_paths = []
     for index, text in enumerate(TEXTS, start=1):
+        torch.manual_seed(args.seed + index - 1)
         inputs = processor(
             text=[f"Speaker 1: {text}"],
-            voice_samples=None,
+            voice_samples=[[str(voice_sample)]] if voice_sample is not None else None,
             padding=True,
             return_tensors="pt",
             return_attention_mask=True,
@@ -114,6 +121,7 @@ def main() -> None:
                 tokenizer=processor.tokenizer,
                 generation_config={"do_sample": False},
                 verbose=False,
+                is_prefill=voice_sample is not None,
             )
         elapsed = time.perf_counter() - started
         if not generated.speech_outputs or generated.speech_outputs[0] is None:
@@ -135,16 +143,19 @@ def main() -> None:
     torch.cuda.empty_cache()
 
     whisper_cache = Path.home() / ".cache" / "whisper"
-    asr = whisper.load_model("large-v3", device="cuda", download_root=str(whisper_cache))
+    asr = whisper.load_model("large-v3", device=args.asr_device, download_root=str(whisper_cache))
     samples = []
     for text, wav_path in zip(TEXTS, wav_paths):
         audio, _ = librosa.load(wav_path, sr=16000, mono=True)
         transcript = asr.transcribe(
             audio,
             language="es",
-            fp16=True,
+            fp16=args.asr_device == "cuda",
             verbose=False,
             condition_on_previous_text=False,
+            temperature=0.0,
+            beam_size=1,
+            sample_len=64,
         )["text"].strip()
         wer = float(jiwer.wer(normalize(text), normalize(transcript)))
         cer = float(jiwer.cer(normalize(text), normalize(transcript)))
@@ -154,6 +165,9 @@ def main() -> None:
     metrics = {
         "source": str(model_path),
         "source_hashes": source_hashes,
+        "seed": args.seed,
+        "voice_sample": str(voice_sample) if voice_sample is not None else None,
+        "voice_sample_hash": sha256(voice_sample) if voice_sample is not None else None,
         "max_wer": args.max_wer,
         "wer": float(np.mean([sample["wer"] for sample in samples])),
         "cer": float(np.mean([sample["cer"] for sample in samples])),

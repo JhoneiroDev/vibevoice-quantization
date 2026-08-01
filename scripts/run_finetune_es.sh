@@ -1,23 +1,24 @@
 #!/bin/bash
 # ============================================================
-# Sprint 1.5: Correccion linguistica VibeVoice-ES (segundo LoRA)
+# Sprint 1.5: Primera adaptacion monolingue VibeVoice -> VibeVoice-ES
 # Hardware: RTX 4060 Ti 8GB VRAM
-# Base: VibeVoice-ES existente; diffusion head y connectors congelados
+# LoRA sobre Qwen + fine-tuning completo del diffusion head preentrenado
 # ============================================================
 set -e
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON_BIN="/home/alfrog/micromamba/envs/vibevoice/bin/python"
-MODEL_PATH="$PROJECT_ROOT/weights/vibevoice-1.5b-es"
+PYTHON_BIN="${1:-${PYTHON_BIN:-python}}"
+MODEL_PATH="$PROJECT_ROOT/weights/vibevoice-1.5b"
 TRAIN_JSONL="$PROJECT_ROOT/data/finetune/cv17_es_train.jsonl"
 VAL_JSONL="$PROJECT_ROOT/data/finetune/cv17_es_val.jsonl"
-OUTPUT_DIR="$PROJECT_ROOT/outputs/finetune_vibevoice_es_correction"
+OUTPUT_DIR="$PROJECT_ROOT/outputs/finetune_vibevoice_es"
 cd "$PROJECT_ROOT"
 
 # Inyectar VibeVoice_repo en PYTHONPATH (requerido para importar vibevoice)
 export PYTHONPATH="$PROJECT_ROOT/VibeVoice_repo:$PYTHONPATH"
+export TOKENIZERS_PARALLELISM=false
 
-echo "[S1.5-03] Iniciando correccion linguistica VibeVoice-ES"
+echo "[S1.5-03] Iniciando adaptacion monolingue VibeVoice-ES"
 echo "Modelo base : $MODEL_PATH"
 echo "Train JSONL : $TRAIN_JSONL"
 echo "Val JSONL   : $VAL_JSONL"
@@ -28,7 +29,7 @@ RESUME_ARGS=()
 LATEST_CHECKPOINT=$(find "$OUTPUT_DIR" -maxdepth 1 -type d -name 'checkpoint-*' -print 2>/dev/null | sort -V | tail -n 1)
 if [[ -n "$LATEST_CHECKPOINT" ]]; then
     echo "Reanudando desde: $LATEST_CHECKPOINT"
-    RESUME_ARGS=(--resume_from_checkpoint "$LATEST_CHECKPOINT")
+    RESUME_ARGS=(--resume_from_checkpoint "$LATEST_CHECKPOINT" --eval_on_start True)
 fi
 
 # Limpiar cache CUDA antes de empezar
@@ -38,13 +39,14 @@ $PYTHON_BIN -m vibevoice.finetune.train_vibevoice \
     --model_name_or_path "$MODEL_PATH" \
     --train_jsonl "$TRAIN_JSONL" \
     --validation_jsonl "$VAL_JSONL" \
+    --max_eval_samples 64 \
     --output_dir "$OUTPUT_DIR" \
     --text_column_name text \
     --audio_column_name audio \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 64 \
-    --learning_rate 1.0e-5 \
+    --learning_rate 2.5e-5 \
     --lr_scheduler_type cosine \
     --warmup_ratio 0.03 \
     --num_train_epochs 1 \
@@ -62,13 +64,13 @@ $PYTHON_BIN -m vibevoice.finetune.train_vibevoice \
     --remove_unused_columns False \
     --gradient_checkpointing False \
     --ddpm_batch_mul 1 \
-    --diffusion_loss_weight 0.0 \
-    --train_diffusion_head False \
+    --diffusion_loss_weight 1.4 \
+    --train_diffusion_head True \
     --train_connectors False \
-    --ce_loss_weight 1.0 \
+    --ce_loss_weight 0.04 \
     --voice_prompt_drop_rate 1.0 \
     --target_audio_dbfs -25.0 \
-    --augment_target_silence False \
+    --augment_target_silence True \
     --lora_r 8 \
     --lora_alpha 32 \
     --lora_dropout 0.05 \

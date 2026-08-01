@@ -2,12 +2,12 @@
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from datasets import load_dataset, DatasetDict, VerificationMode
+from datasets import VerificationMode, load_dataset
 
 from transformers import (
     HfArgumentParser,
@@ -20,7 +20,6 @@ from transformers import TrainingArguments as HfTrainingArguments
 from peft import LoraConfig, get_peft_model, TaskType
 
 from vibevoice.modular.modeling_vibevoice import VibeVoiceForConditionalGeneration
-from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 
 from vibevoice.finetune.data_vibevoice import VibeVoiceDataset, VibeVoiceCollator
@@ -65,6 +64,10 @@ class DataArguments:
     eval_split_size: float = field(default=0.0)
     ignore_verifications: bool = field(default=False)
     max_length: Optional[int] = field(default=None)
+    max_eval_samples: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional deterministic cap for periodic evaluation samples."},
+    )
     train_jsonl: Optional[str] = field(default=None, metadata={"help": "Path to local train JSONL with {text, audio, [voice_prompts]}"})
     validation_jsonl: Optional[str] = field(default=None, metadata={"help": "Optional path to local validation JSONL"})
     voice_prompt_drop_rate: float = field(
@@ -120,11 +123,19 @@ def build_head_lora_config(args: ModelArguments) -> LoraConfig:
         target_modules=target_modules,
     )
 
-def mask_for_ce(labels: torch.Tensor, attention_mask: torch.Tensor, acoustic_input_mask: torch.Tensor, pad_id: int = -100) -> torch.Tensor:
+def mask_for_ce(
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor,
+    acoustic_loss_mask: torch.Tensor,
+    pad_id: int = -100,
+) -> torch.Tensor:
     shifted = labels[:, 1:].contiguous()
     base_mask = attention_mask[:, 1:].contiguous().eq(1) if (attention_mask is not None and attention_mask.numel() > 0) else torch.ones_like(shifted, dtype=torch.bool)
-    label_is_acoustic = acoustic_input_mask[:, 1:].contiguous()
-    final_mask = base_mask & (~label_is_acoustic)
+    # Supervise every target speech-diffusion continuation and its one terminal
+    # token. Prompt text and voice-prompt acoustics are conditioning, not labels.
+    target_continuation = acoustic_loss_mask[:, 1:].contiguous()
+    target_end = acoustic_loss_mask[:, :-1].contiguous() & (~target_continuation)
+    final_mask = base_mask & (target_continuation | target_end)
     out = shifted.clone()
     out[~final_mask] = pad_id
     return out
@@ -355,7 +366,9 @@ def main() -> None:
     # Diffusion head LoRA wrapping (optional)
     if getattr(model_args, "lora_wrap_diffusion_head", False) and hasattr(model.model, "prediction_head"):
         class _HeadForwardShim(nn.Module):
-            def __init__(self, base: nn.Module): super().__init__(); self.base = base
+            def __init__(self, base: nn.Module):
+                super().__init__()
+                self.base = base
             def forward(self, *args, **kwargs):
                 if len(args) >= 3:
                     noisy_images, timesteps, condition = args[:3]
@@ -459,6 +472,10 @@ def main() -> None:
         elif data_args.eval_split_size and data_args.eval_split_size > 0 and len(train_ds) > 1:
             split = train_ds.train_test_split(test_size=data_args.eval_split_size, seed=training_args.seed)
             train_ds, eval_ds = split["train"], split["test"]
+        if eval_ds is not None and data_args.max_eval_samples is not None:
+            limit = min(len(eval_ds), data_args.max_eval_samples)
+            eval_ds = eval_ds.select(range(limit))
+            logger.info("Periodic evaluation capped at %d deterministic samples.", limit)
 
     train_dataset = VibeVoiceDataset(
         train_ds,
@@ -570,10 +587,8 @@ def main() -> None:
             attention_mask = inputs.get("attention_mask")
             position_ids = inputs.get("position_ids")
             past_key_values = inputs.get("past_key_values")
-            inputs_embeds = inputs.get("inputs_embeds")
             use_cache = inputs.get("use_cache", False)
             output_attentions = inputs.get("output_attentions")
-            output_hidden_states = inputs.get("output_hidden_states")
             return_dict = inputs.get("return_dict", True)
             cache_position = inputs.get("cache_position")
             
@@ -739,6 +754,8 @@ def main() -> None:
             labels = inputs.get("input_ids")
             attention_mask = inputs.get("attention_mask")
             acoustic_input_mask = inputs.get("acoustic_input_mask")
+            global_step = int(getattr(self.state, "global_step", 0) or 0)
+            log_components = global_step != getattr(self, "_last_component_log_step", -1)
 
             # Ensure semantic tensors exist and have correct dtype/device
             sem = inputs.get("speech_semantic_tensors", None)
@@ -762,12 +779,13 @@ def main() -> None:
                 num_tok_loss = int(al_mask.sum().item()) if al_mask is not None else 0
                 num_lat_total = int(sp_masks.sum().item()) if sp_masks is not None else 0
                 num_lat_loss = int(((sp_loss_sel & sp_masks).sum().item())) if (sp_loss_sel is not None and sp_masks is not None) else 0
-                self.log({
-                    "debug/num_tok_total": float(num_tok_total),
-                    "debug/num_tok_loss": float(num_tok_loss),
-                    "debug/num_lat_total": float(num_lat_total),
-                    "debug/num_lat_loss": float(num_lat_loss),
-                })
+                if log_components:
+                    self.log({
+                        "debug/num_tok_total": float(num_tok_total),
+                        "debug/num_tok_loss": float(num_tok_loss),
+                        "debug/num_lat_total": float(num_lat_total),
+                        "debug/num_lat_loss": float(num_lat_loss),
+                    })
                 if sp_loss_sel is not None and sp_masks is not None and al_mask is not None:
                     if num_tok_loss != num_lat_loss:
                         raise RuntimeError(
@@ -787,7 +805,10 @@ def main() -> None:
 
             # CE Loss
             logits = outputs.logits
-            ce_labels = mask_for_ce(labels, attention_mask, acoustic_input_mask, pad_id=-100)
+            acoustic_loss_mask = inputs.get("acoustic_loss_mask")
+            if acoustic_loss_mask is None:
+                raise ValueError("acoustic_loss_mask is required for target-only CE")
+            ce_labels = mask_for_ce(labels, attention_mask, acoustic_loss_mask, pad_id=-100)
             shift_logits = logits[:, :-1, :].contiguous()
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
             ce_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), ce_labels.view(-1))
@@ -804,19 +825,38 @@ def main() -> None:
 
             # Logs
             try:
-                prefix = "train" if model.training else "eval"
-                self.log({
-                    f"{prefix}/ce_loss": ce_loss.detach().item(),
-                    f"{prefix}/diffusion_loss": diffusion_loss.detach().item() if isinstance(diffusion_loss, torch.Tensor) else float(diffusion_loss),
-                })
-                if hasattr(self, "optimizer") and self.optimizer is not None and len(self.optimizer.param_groups) > 0:
-                    lr_val = self.optimizer.param_groups[0].get("lr", None)
-                    if lr_val is not None:
-                        self.log({"train/learning_rate_real": float(lr_val)})
+                if log_components:
+                    prefix = "train" if model.training else "eval"
+                    self.log({
+                        f"{prefix}/ce_loss": ce_loss.detach().item(),
+                        f"{prefix}/diffusion_loss": diffusion_loss.detach().item() if isinstance(diffusion_loss, torch.Tensor) else float(diffusion_loss),
+                    })
+                    if hasattr(self, "optimizer") and self.optimizer is not None and len(self.optimizer.param_groups) > 0:
+                        lr_val = self.optimizer.param_groups[0].get("lr", None)
+                        if lr_val is not None:
+                            self.log({"train/learning_rate_real": float(lr_val)})
+                    self._last_component_log_step = global_step
             except Exception:
                 pass
 
             return (total, outputs) if return_outputs else total
+
+        def prediction_step(
+            self,
+            model: VibeVoiceForConditionalGeneration,
+            inputs: Dict[str, Any],
+            prediction_loss_only: bool,
+            ignore_keys=None,
+        ):
+            # The base Trainer calls model(**inputs) when it cannot infer label
+            # names. VibeVoice needs training_forward() to derive semantic
+            # features on GPU, so evaluation must use compute_loss as well.
+            if not prediction_loss_only:
+                raise ValueError("VibeVoice evaluation supports prediction_loss_only=True")
+            inputs = self._prepare_inputs(inputs)
+            with torch.no_grad(), self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs)
+            return loss.detach().mean(), None, None
 
         def _debug_ce(self, shift_logits: torch.Tensor, ce_labels: torch.Tensor, attention_mask: Optional[torch.Tensor], acoustic_input_mask: Optional[torch.Tensor]):
             try:

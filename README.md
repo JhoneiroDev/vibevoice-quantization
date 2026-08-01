@@ -13,7 +13,7 @@ Este proyecto constituye el marco experimental de una tesis que evalua tres tecn
 | Sprint | Enfoque | Estado |
 |--------|---------|--------|
 | **Sprint 1** | Infraestructura de datos y set de calibracion | Completado |
-| **Sprint 1.5** | Correccion linguistica espanola (segundo LoRA CE-only) | Implementado, ejecucion pendiente |
+| **Sprint 1.5** | Primera adaptacion monolingue: LoRA + diffusion head | Completado; gate con voz WER=0.2321 |
 | **Sprint 2** | GGUF IQ4_NL selectivo + runtime C++ CrispASR | Implementado, espera checkpoint corregido |
 | **Sprint 2.5** | Analisis de arquitectura y diagnostico de fallos | Completado |
 | **Sprint 3** | GPTQ W4 g128 selectivo con loader hibrido Triton | Implementado, espera checkpoint corregido |
@@ -111,14 +111,16 @@ python verify_stack.py
 
 ### 2. Fine-tuning monolingue (espanol) — Sprint 1.5
 
-Usa `train` de Common Voice 17.0 con un desarrollo speaker-disjoint excluido del entrenamiento. El split nativo `validation` queda reservado para calibracion PTQ. La correccion usa como base `vibevoice-1.5b-es`, LoRA rank 8, LR `1e-5`, CE weight `1.0` y diffusion weight `0.0`; diffusion head, connectors y tokenizers permanecen congelados.
+Existe una sola linea canonica: `weights/vibevoice-1.5b` -> primer LoRA + diffusion head -> `weights/vibevoice-1.5b-es`. Usa `train` de Common Voice 17.0 con un desarrollo speaker-disjoint excluido del entrenamiento; el split nativo `validation` queda reservado para calibracion PTQ.
+
+El checkpoint historico fue entrenado durante 18.6 h con LoRA rank 8, alpha 32, LR `2.5e-5`, CE weight `0.04`, diffusion weight `1.4` y fine-tuning completo del diffusion head. La implementacion publica conserva esos hiperparametros para documentar el experimento, pero corrige la mascara CE, el split, la normalizacion, la semantica y el checkpointing. Una ejecucion nueva es por ello una reproduccion metodologica mejorada, no bit a bit.
 
 ```bash
 bash scripts/run_finetune_es.sh
 bash scripts/merge_es_checkpoint.sh
 ```
 
-El checkpoint resultante **VibeVoice-ES-Corrected** se guarda como BF16 en `weights/vibevoice-1.5b-es-corrected/`. Debe superar el gate WER/CER del notebook antes de regenerar las variantes cuantizadas.
+El resultado se guarda en `weights/vibevoice-1.5b-es/`. El gate usa una voz de referencia versionada, seis frases espanolas, Whisper large-v3 y umbral `WER <= 0.30`. El checkpoint existente obtuvo WER `0.2321`, frente a `0.6230` del VibeVoice default bajo el mismo protocolo. El segundo LoRA CE-only posterior fue rechazado con WER `1.0` y no forma parte del pipeline publicado.
 
 Sprint 2 descarga el runtime CUDA precompilado de CrispASR `v0.8.23`, verifica su SHA-256 y guarda el GGUF validado junto con su manifiesto:
 
@@ -158,7 +160,7 @@ Las celdas largas desde `S1.5-03` se ejecutan como jobs desacoplados del kernel.
 | Sprint | Modelo | WER | PPL |
 |--------|--------|-----|-----|
 | Sprint 1 | Datos + calibracion | — | — |
-| Sprint 1.5 | VibeVoice-ES (fine-tuned) | — | — |
+| Sprint 1.5 | VibeVoice-ES (primer LoRA) | 0.2321 con voice prompt | — |
 | Sprint 2 | GGUF IQ4_NL selectivo | Pendiente | — |
 | Sprint 3 | GPTQ W4 g128 selectivo | Pendiente | — |
 | Sprint 4 | AWQ W4A16 g128 selectivo | Pendiente | — |

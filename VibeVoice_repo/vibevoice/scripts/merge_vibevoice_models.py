@@ -69,6 +69,21 @@ def merge_llm_lora(model: VibeVoiceForConditionalGeneration, checkpoint_path: st
     """Merge LLM LoRA adapters into base model."""
     
     logger.info("Merging LLM LoRA adapters...")
+
+    language_model = model.model.language_model
+    if getattr(language_model, "is_quantized", False) or any(
+        hasattr(module, "qweight") for module in language_model.modules()
+    ):
+        raise ValueError("Sprint 1.5 LoRA merge requires a dense language model")
+
+    # PEFT 0.19.1 probes quantized dispatchers even for dense nn.Linear and
+    # rejects the GPTQModel 2.2.0 package pinned for Sprint 3.
+    from peft.tuners.lora import awq as peft_lora_awq
+    from peft.tuners.lora import gptq as peft_lora_gptq
+
+    peft_lora_awq.is_gptqmodel_available = lambda: False
+    peft_lora_gptq.is_gptqmodel_available = lambda: False
+    logger.info("Disabled PEFT AWQ/GPTQ dispatchers for dense Sprint 1.5 merge.")
     
     try:
         from peft import PeftModel
@@ -77,7 +92,7 @@ def merge_llm_lora(model: VibeVoiceForConditionalGeneration, checkpoint_path: st
     
     # Load and merge LoRA
     language_model_with_lora = PeftModel.from_pretrained(
-        model.model.language_model,
+        language_model,
         checkpoint_path
     )
     
@@ -113,7 +128,7 @@ def merge_diffusion_head(model: VibeVoiceForConditionalGeneration, checkpoint_pa
     
     if trained_weights_path is None:
         raise ValueError(
-            f"Diffusion head weights not found. Searched:\n" +
+            "Diffusion head weights not found. Searched:\n" +
             "\n".join(f"  - {p}" for p in possible_files)
         )
     
@@ -244,12 +259,12 @@ def verify_merge(
                 mismatches.append(f"{key} (values differ)")
         
         if mismatches:
-            logger.error(f"✗ Weight mismatches found:")
+            logger.error("✗ Weight mismatches found:")
             for mm in mismatches[:5]:  # Show first 5
                 logger.error(f"  - {mm}")
             if len(mismatches) > 5:
                 logger.error(f"  ... and {len(mismatches) - 5} more")
-            raise ValueError(f"✗ ERROR: Trained and merged weights do not match!")
+            raise ValueError("✗ ERROR: Trained and merged weights do not match!")
         
         logger.info(f"✓ All trained weights correctly merged: {len(trained_state_dict)} parameters verified")
     

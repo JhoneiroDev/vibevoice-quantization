@@ -91,6 +91,13 @@ def run_persistent_job(
             raise RuntimeError(f"[{name}] hay otro comando activo con PID {pid}")
         print(f"[{name}] reconectado al PID {pid}. Log: {log_path}")
     else:
+        if log_path.is_file() and (
+            status.get("state") in {"completed", "failed"}
+            or status.get("command_hash") != command_hash
+        ):
+            archived_log = state_dir / f"job-{int(time.time())}.log"
+            os.replace(log_path, archived_log)
+            print(f"[{name}] log anterior archivado en {archived_log}")
         _atomic_json(spec_path, spec)
         _atomic_json(
             status_path,

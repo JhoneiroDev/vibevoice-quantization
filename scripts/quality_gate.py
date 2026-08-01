@@ -24,5 +24,5 @@ def validate_quality_gate(model_path: str | Path, metrics_path: str | Path) -> d
     files = [model / "config.json", *sorted(model.glob("*.safetensors"))]
     current = {path.name: _sha256(path) for path in files if path.is_file()}
     if not current or current != metrics.get("source_hashes"):
-        raise ValueError("Sprint 1.5 quality gate hashes do not match the corrected checkpoint")
+        raise ValueError("Sprint 1.5 quality gate hashes do not match the Spanish checkpoint")
     return metrics

@@ -20,8 +20,8 @@ Este proyecto constituye el marco experimental de una tesis que evalua tres tecn
 | **Sprint 4** | AWQ W4A16 g128 selectivo con AutoAWQ/Triton | Implementado; build canonico pendiente |
 | **Sprint 5** | INT8 selectiva (Fabio Sarracino + HelpfulHand3) | Validado; WER=0.1409, pico=3.99 GiB |
 | **Sprint 6** | NF4 + double quant (DevParker/Dubedo + Soniqo) | Rechazado por gate; WER=0.3304 |
-| **Sprint 7** | FP8 E4M3FN dinamico (Zhao-Kun + CyberVoice) | No compatible con RTX 4060 Ti (`_scaled_mm`) |
-| **Sprint 8** | 🏁 Benchmark: 6 modelos + validacion estadistica | Pendiente |
+| **Sprint 7** | SmoothQuant W8A8 selectivo sobre Qwen2 | Validado; WER=0.1518, pico=3.96 GiB |
+| **Sprint 8** | 🏁 Benchmark: 7 modelos + validacion estadistica | Pendiente |
 
 Ver [`docs/quantization_architecture_analysis.md`](docs/quantization_architecture_analysis.md) para el analisis completo de la arquitectura, compatibilidad con GPTQ/AWQ, y diagnostico de fallos previos.
 
@@ -187,10 +187,10 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 - **GPTQ requiere un loader hibrido:** las matrices empaquetadas (`qweight`, `qzeros`, `scales`, `g_idx`) no pueden copiarse a `nn.Linear` mediante `state_dict`. Sprint 3 carga el decoder con GPTQModel/Triton y trasplanta el objeto `Qwen2Model`; los modulos TTS protegidos se cargan por separado en BF16.
 - **AWQ usa GEMM/Triton, no Marlin:** AutoAWQ 0.2.9 produce 196 modulos `WQLinear_GEMM` W4A16 asimetricos. `awq_ext` no esta instalado en este host; etiquetar este artefacto como Marlin seria incorrecto.
 - **Conv1D debe permanecer en FP16/FP32:** Cuantizar capas convolucionales de tokenizers corrompe las salidas acusticas (hallazgo Mudler/LocalAI). Refuerza exclusion de `acoustic_tokenizer` y `semantic_tokenizer`.
-- **AdaLN del diffusion head es fragil bajo INT4:** Los bloques Adaptive Layer Normalization fallan bajo ciertos esquemas INT4 (hallazgo FluffyBunnies/ONNX). Considerar FP16 o FP8 para diffusion head.
-- **DPM-Solver sensible a INT:** El desnatador de ruido del diffusion head genera "voz metalica" bajo cuantizacion entera. FP8 lo elimina al mantener exponentes flotantes (CyberVoice Labs).
+- **AdaLN del diffusion head es fragil bajo INT4:** Los bloques Adaptive Layer Normalization fallan bajo ciertos esquemas INT4 (hallazgo FluffyBunnies/ONNX). El diffusion head permanece en BF16.
+- **DPM-Solver sensible a INT:** El diffusion head permanece protegido; SmoothQuant solo se aplica al decoder Qwen.
 - **embed_tokens debe preservarse para clonacion:** Excluir `embed_tokens` en esquemas NF4 protege la identidad de voz en generaciones largas (>30s) (Soniqo).
-- **lm_head tied con embed_tokens:** En Qwen2.5-1.5B, `lm_head.weight` comparte memoria con `embed_tokens.weight`. Cuantizar `lm_head` corrompe embeddings de entrada. Excluir en GPTQ/INT8/NF4/FP8.
+- **lm_head tied con embed_tokens:** En Qwen2.5-1.5B, `lm_head.weight` comparte memoria con `embed_tokens.weight`. Cuantizar `lm_head` corrompe embeddings de entrada. Excluir en GPTQ/INT8/NF4/SmoothQuant.
 
 ## Variantes de Cuantizacion (PTQ a INT4)
 
@@ -202,7 +202,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 | **AWQ** ($X_3$) | Proteccion de canales W4A16 g128, Qwen-only | AutoAWQ/Triton | Implementado; benchmark corregido pendiente |
 | **INT8** | Selectiva LLM-only | bitsandbytes | Pendiente (Sprint 5) |
 | **NF4** | NormalFloat4 + double quant selectivo | bitsandbytes | Implementado; 3.25 GB VRAM de reposo, benchmark pendiente |
-| **FP8** | E4M3FN dinamico, salida BF16 | torch._scaled_mm | Implementado; 3.89 GB VRAM tras recarga, benchmark pendiente |
+| **SmoothQuant** | W8A8 selectivo, salida BF16 | `torch._int_mm` | Validado; 3.83 GiB idle, 3.96 GiB pico, WER=0.1518 |
 
 ### Tabla Comparativa Final (Sprint 8 — Benchmark)
 
@@ -214,7 +214,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 | AWQ | Pendiente | Pendiente | Pendiente | Pendiente | — |
 | INT8 | Pendiente | Pendiente | Pendiente | Pendiente | — |
 | NF4 | Pendiente | Pendiente | Pendiente | Pendiente | — |
-| FP8 | Pendiente | Pendiente | Pendiente | Pendiente | — |
+| SmoothQuant W8A8 | 3.96 | 1.5632 | 0.1518 | 0.0884 | — |
 
 ## Metricas de Evaluacion
 

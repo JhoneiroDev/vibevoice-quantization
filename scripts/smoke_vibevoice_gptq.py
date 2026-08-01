@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402
 """Fresh-process reload and TTS smoke test for the selective GPTQ artifact."""
 
 import argparse
@@ -20,6 +21,7 @@ if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 
 from gptq_vibevoice import VibeVoiceProcessor, load_gptq_vibevoice
+from quantization_common import atomic_json
 
 
 def main():
@@ -113,14 +115,14 @@ def main():
     if packed != 196:
         raise RuntimeError(f"Expected 196 GPTQ modules, found {packed}")
     metrics_path = args.output.with_suffix(".json")
-    metrics_path.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
+    atomic_json(metrics_path, metrics)
     manifest_path = args.model / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("status") not in {"structure_validated", "validated"}:
         raise RuntimeError(f"Unexpected pre-smoke artifact status: {manifest.get('status')}")
     manifest["status"] = "validated"
     manifest["smoke"] = metrics
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    atomic_json(manifest_path, manifest)
     print(json.dumps(metrics, indent=2))
 
 

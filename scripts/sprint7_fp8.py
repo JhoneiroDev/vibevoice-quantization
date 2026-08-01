@@ -38,12 +38,14 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 from scripts.fp8_vibevoice import (
     DynamicScaledFP8Linear,
     load_fp8_vibevoice,
+    probe_native_fp8,
     replace_qwen_linears_with_fp8,
 )
+from scripts.quantization_common import atomic_json, source_hashes, validate_canonical_source
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 
-MODEL_ES_PATH = S7_ROOT / "weights" / "vibevoice-1.5b-es-corrected"
+MODEL_ES_PATH = S7_ROOT / "weights" / "vibevoice-1.5b-es"
 FP8_FINAL = S7_ROOT / "weights" / "vibevoice-1.5b-es-fp8"
 FP8_OUT = FP8_FINAL.with_name(FP8_FINAL.name + ".partial")
 SPRINT7_OUTPUT = S7_ROOT / "outputs" / "sprint7_fp8"
@@ -51,8 +53,20 @@ SPRINT7_OUTPUT.mkdir(parents=True, exist_ok=True)
 TARGET_SR = 24000
 FP8_RANGE_LIMIT = 240.0
 
-assert torch.cuda.is_available(), "Sprint 7 requiere una GPU CUDA."
-assert hasattr(torch, "_scaled_mm"), "Este PyTorch no expone torch._scaled_mm."
+validate_canonical_source(MODEL_ES_PATH)
+try:
+    probe_native_fp8("cuda:0")
+except RuntimeError as error:
+    compatibility = {
+        "model": str(MODEL_ES_PATH.resolve()),
+        "source_hashes": source_hashes(MODEL_ES_PATH),
+        "supported": False,
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "reason": str(error),
+    }
+    atomic_json(SPRINT7_OUTPUT / "metrics.json", compatibility)
+    print(json.dumps(compatibility, indent=2))
+    raise SystemExit(0)
 fp8_max = torch.finfo(torch.float8_e4m3fn).max
 assert FP8_RANGE_LIMIT < fp8_max
 print(f"GPU: {torch.cuda.get_device_name(0)} | FP8 max={fp8_max} | limite={FP8_RANGE_LIMIT}")
@@ -130,12 +144,6 @@ assert m_fp8.model.language_model.embed_tokens.weight.dtype == torch.bfloat16
 assert m_fp8.lm_head.weight is m_fp8.model.language_model.embed_tokens.weight
 vram_fp8_idle = torch.cuda.memory_allocated() / 1024**3
 print(f"Recarga FP8 verificada: {len(reloaded_fp8_names)} capas, {vram_fp8_idle:.2f} GB")
-if FP8_FINAL.exists():
-    shutil.rmtree(FP8_FINAL)
-FP8_OUT.replace(FP8_FINAL)
-FP8_OUT = FP8_FINAL
-print(f"Artefacto FP8 promovido atomicamente: {FP8_FINAL}")
-
 # En GPUs menores puede usarse device_map="auto" y max_memory. Esto ofrece
 # offload por modulos de Accelerate, no descarga circular custom del KV cache.
 test_texts_fp8 = [
@@ -235,11 +243,18 @@ metrics_fp8 = {
     "vram_peak_gb": peak_vram_fp8,
     "rtf": rtf_fp8, "wer": wer_fp8, "cer": cer_fp8,
 }
+metrics_fp8["passed"] = wer_fp8 <= 0.30
 metrics_path = SPRINT7_OUTPUT / "metrics.json"
 metrics_temporary = metrics_path.with_suffix(".json.tmp")
 with open(metrics_temporary, "w", encoding="utf-8") as file:
     json.dump(metrics_fp8, file, indent=2)
 metrics_temporary.replace(metrics_path)
+if not metrics_fp8["passed"]:
+    raise RuntimeError(f"FP8 quality gate failed: WER {wer_fp8:.4f} > 0.3000")
+if FP8_FINAL.exists():
+    shutil.rmtree(FP8_FINAL)
+FP8_OUT.replace(FP8_FINAL)
+print(f"Artefacto FP8 promovido atomicamente: {FP8_FINAL}")
 print(
     f"\n=== FP8 DINAMICO === VRAM idle: {vram_fp8_idle:.2f} GB | "
     f"VRAM peak: {peak_vram_fp8:.2f} GB | RTF: {rtf_fp8:.4f} | "

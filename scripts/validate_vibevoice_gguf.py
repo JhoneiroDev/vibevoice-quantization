@@ -9,6 +9,8 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from quantization_common import source_hashes, validate_canonical_source
+
 
 TARGET = re.compile(
     r"^lm\.layers\.\d+\."
@@ -31,11 +33,13 @@ def main() -> None:
     parser.add_argument("model", type=Path)
     parser.add_argument("--gguf-python", type=Path, required=True)
     parser.add_argument("--manifest", type=Path)
-    parser.add_argument("--source", type=Path)
+    parser.add_argument("--source", type=Path, required=True)
     args = parser.parse_args()
 
     if not args.model.is_file():
         raise FileNotFoundError(args.model)
+    source = args.source.resolve()
+    validate_canonical_source(source)
     sys.path.insert(0, str(args.gguf_python.resolve()))
     import gguf  # type: ignore[import-not-found]
 
@@ -76,7 +80,8 @@ def main() -> None:
         "runtime": "CrispASR v0.8.23",
         "quantization": "selective IQ4_NL",
         "model": str(args.model.resolve()),
-        "source": str(args.source.resolve()) if args.source else None,
+        "source": str(source),
+        "source_hashes": source_hashes(source),
         "size_bytes": args.model.stat().st_size,
         "sha256": sha256(args.model),
         "tensor_types": dict(sorted(type_counts.items())),
@@ -84,6 +89,11 @@ def main() -> None:
         "protected_audio_tensors": len(audio_tensors),
     }
     if args.manifest:
+        if args.manifest.is_file():
+            previous = json.loads(args.manifest.read_text(encoding="utf-8"))
+            for key in ("source", "source_hashes", "sha256", "iq4_nl_qwen_matrices"):
+                if previous.get(key) != result[key]:
+                    raise AssertionError(f"Existing GGUF manifest mismatch for {key}")
         args.manifest.parent.mkdir(parents=True, exist_ok=True)
         args.manifest.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(result, indent=2))

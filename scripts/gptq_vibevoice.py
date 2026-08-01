@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402
 """Build, validate, and load a selective GPTQ VibeVoice checkpoint."""
 
 from __future__ import annotations
@@ -7,11 +8,9 @@ import argparse
 import gc
 import hashlib
 import json
-import os
 import re
 import shutil
 import sys
-from collections import Counter
 from pathlib import Path
 
 import torch
@@ -40,6 +39,20 @@ from transformers import Qwen2Config, Qwen2ForCausalLM
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
+try:
+    from quantization_common import (
+        atomic_json,
+        validate_canonical_source,
+        validate_finite_checkpoint,
+        validate_manifest_source,
+    )
+except ModuleNotFoundError:
+    from scripts.quantization_common import (
+        atomic_json,
+        validate_canonical_source,
+        validate_finite_checkpoint,
+        validate_manifest_source,
+    )
 
 
 TARGET_RE = re.compile(
@@ -146,10 +159,7 @@ def build_calibration(tokenizer, metadata_path: Path, output_path: Path, sequenc
 
 
 def prepare(source: Path, output: Path, metadata: Path, force: bool) -> None:
-    if not (source / "config.json").is_file():
-        raise FileNotFoundError(
-            f"Missing corrected checkpoint: {source}. Complete and validate Sprint 1.5 first."
-        )
+    validate_canonical_source(source)
     if output.exists():
         if not force:
             raise FileExistsError(f"Output exists: {output}; pass --force to rebuild")
@@ -224,7 +234,7 @@ def prepare(source: Path, output: Path, metadata: Path, force: bool) -> None:
         },
         "calibration": {key: value for key, value in calibration.items() if key != "samples"},
     }
-    (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    atomic_json(output / "manifest.json", manifest)
     print(f"Prepared BF16 decoder and protected VibeVoice modules in {output}")
 
 
@@ -275,8 +285,10 @@ def validate(output: Path, remove_work: bool = False) -> dict:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("schema") != SCHEMA:
         raise ValueError("Unsupported or legacy GPTQ artifact")
+    validate_manifest_source(manifest)
 
     decoder_inventory = tensor_inventory(output / "decoder-gptq")
+    validate_finite_checkpoint(output / "decoder-gptq")
     packed = {suffix: set() for suffix in PACKED_SUFFIXES}
     for name in decoder_inventory:
         for suffix in PACKED_SUFFIXES:
@@ -294,6 +306,7 @@ def validate(output: Path, remove_work: bool = False) -> dict:
         raise AssertionError("Audio tensor found inside GPTQ decoder")
 
     protected_inventory = tensor_inventory(output / "protected")
+    validate_finite_checkpoint(output / "protected")
     if any(name.startswith("model.language_model.") or name == "lm_head.weight" for name in protected_inventory):
         raise AssertionError("Dense language-model tensor found in protected artifact")
     required_prefixes = (
@@ -349,7 +362,7 @@ def validate(output: Path, remove_work: bool = False) -> dict:
         manifest["status"] = "structure_validated"
         manifest["artifacts"] = current_artifacts
         manifest["validation"] = current_validation
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        atomic_json(manifest_path, manifest)
     if remove_work:
         shutil.rmtree(output / ".work", ignore_errors=True)
     print(json.dumps(current_validation, indent=2))

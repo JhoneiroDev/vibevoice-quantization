@@ -13,6 +13,42 @@ FP8_DTYPE = torch.float8_e4m3fn
 DEFAULT_RANGE_LIMIT = 240.0
 
 
+def expected_qwen_linears() -> set[str]:
+    names = set()
+    for layer in range(28):
+        prefix = f"model.language_model.layers.{layer}"
+        for projection in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            names.add(f"{prefix}.self_attn.{projection}")
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            names.add(f"{prefix}.mlp.{projection}")
+    return names
+
+
+def probe_native_fp8(device: str = "cuda:0") -> None:
+    """Fail before model loading when the GPU lacks native scaled FP8 matmul."""
+    if not torch.cuda.is_available() or not hasattr(torch, "_scaled_mm"):
+        raise RuntimeError("Native FP8 requires CUDA and torch._scaled_mm")
+    try:
+        left = torch.ones((16, 16), device=device, dtype=FP8_DTYPE)
+        right = torch.ones((16, 16), device=device, dtype=FP8_DTYPE)
+        scale = torch.ones((), device=device, dtype=torch.float32)
+        output = torch._scaled_mm(
+            left,
+            right,
+            scale_a=scale,
+            scale_b=scale,
+            out_dtype=torch.bfloat16,
+            use_fast_accum=False,
+        )
+        torch.cuda.synchronize()
+        if output.shape != (16, 16) or not torch.isfinite(output).all():
+            raise RuntimeError("torch._scaled_mm returned an invalid result")
+    except Exception as error:
+        raise RuntimeError(
+            f"Native FP8 torch._scaled_mm is unsupported on {torch.cuda.get_device_name(0)}"
+        ) from error
+
+
 class DynamicScaledFP8Linear(nn.Module):
     """FP8 weight linear with per-tensor dynamic activation scaling."""
 
@@ -135,6 +171,12 @@ def replace_qwen_linears_with_fp8(
         for name, module in model.named_modules()
         if name.startswith("model.language_model.") and isinstance(module, nn.Linear)
     ]
+    names = {name for name, _ in targets}
+    if names != expected_qwen_linears():
+        raise RuntimeError(
+            f"Invalid FP8 targets: missing={sorted(expected_qwen_linears() - names)[:5]}, "
+            f"unexpected={sorted(names - expected_qwen_linears())[:5]}"
+        )
     for name, linear in targets:
         _set_module(
             model,
@@ -155,6 +197,12 @@ def replace_qwen_linears_with_empty_fp8(
         for name, module in model.named_modules()
         if name.startswith("model.language_model.") and isinstance(module, nn.Linear)
     ]
+    names = {name for name, _ in targets}
+    if names != expected_qwen_linears():
+        raise RuntimeError(
+            f"Invalid FP8 reload targets: missing={sorted(expected_qwen_linears() - names)[:5]}, "
+            f"unexpected={sorted(names - expected_qwen_linears())[:5]}"
+        )
     for name, linear in targets:
         _set_module(
             model,
@@ -177,6 +225,8 @@ def load_fp8_vibevoice(
     max_memory: dict | None = None,
 ):
     """Load a checkpoint saved with DynamicScaledFP8Linear modules."""
+    if device_map == {"": "cuda:0"} or device_map == "cuda:0":
+        probe_native_fp8("cuda:0")
     from accelerate import init_empty_weights, load_checkpoint_and_dispatch
     from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
     from vibevoice.modular.modeling_vibevoice_inference import (

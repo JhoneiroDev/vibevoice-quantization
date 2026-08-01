@@ -38,6 +38,20 @@ from transformers import AutoTokenizer, Qwen2Config, Qwen2ForCausalLM
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
+try:
+    from quantization_common import (
+        atomic_json,
+        validate_canonical_source,
+        validate_finite_checkpoint,
+        validate_manifest_source,
+    )
+except ModuleNotFoundError:
+    from scripts.quantization_common import (
+        atomic_json,
+        validate_canonical_source,
+        validate_finite_checkpoint,
+        validate_manifest_source,
+    )
 
 
 PACKED_SUFFIXES = ("qweight", "qzeros", "scales")
@@ -135,10 +149,7 @@ def build_calibration(tokenizer, metadata_path: Path, output_path: Path):
 
 
 def prepare(source: Path, output: Path, metadata: Path, force: bool) -> None:
-    if not (source / "config.json").is_file():
-        raise FileNotFoundError(
-            f"Missing corrected checkpoint: {source}. Complete and validate Sprint 1.5 first."
-        )
+    validate_canonical_source(source)
     if output.exists():
         if not force:
             raise FileExistsError(f"Output exists: {output}; pass --force to rebuild")
@@ -220,7 +231,7 @@ def prepare(source: Path, output: Path, metadata: Path, force: bool) -> None:
             "max_tokens": max(calibration["token_lengths"]),
         },
     }
-    (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    atomic_json(output / "manifest.json", manifest)
     print(f"Prepared FP16 decoder and protected VibeVoice modules in {output}")
 
 
@@ -279,6 +290,7 @@ def validate(output: Path, remove_work: bool = False) -> dict:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("schema") != SCHEMA:
         raise ValueError("Unsupported or legacy AWQ artifact")
+    validate_manifest_source(manifest)
     if manifest.get("status") not in {"prepared", "structure_validated", "validated"}:
         raise ValueError(f"Invalid AWQ artifact status: {manifest.get('status')!r}")
 
@@ -296,6 +308,7 @@ def validate(output: Path, remove_work: bool = False) -> dict:
             raise AssertionError(f"Invalid AWQ config {key}: {quant_config.get(key)!r}")
 
     decoder_inventory = tensor_inventory(output / "decoder-awq")
+    validate_finite_checkpoint(output / "decoder-awq")
     packed = {suffix: set() for suffix in PACKED_SUFFIXES}
     for name in decoder_inventory:
         for suffix in PACKED_SUFFIXES:
@@ -322,6 +335,7 @@ def validate(output: Path, remove_work: bool = False) -> dict:
         raise AssertionError("Audio tensor found inside AWQ decoder")
 
     protected_inventory = tensor_inventory(output / "protected")
+    validate_finite_checkpoint(output / "protected")
     if any(name.startswith("model.language_model.") or name == "lm_head.weight" for name in protected_inventory):
         raise AssertionError("Dense language-model tensor found in protected artifact")
     required_prefixes = (
@@ -375,7 +389,7 @@ def validate(output: Path, remove_work: bool = False) -> dict:
         manifest["status"] = "structure_validated"
         manifest["artifacts"] = current_artifacts
         manifest["validation"] = current_validation
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        atomic_json(manifest_path, manifest)
     if remove_work:
         shutil.rmtree(output / ".work", ignore_errors=True)
     print(json.dumps(current_validation, indent=2))

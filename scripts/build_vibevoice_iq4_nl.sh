@@ -3,10 +3,11 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PYTHON_BIN=${PYTHON_BIN:-python}
-SOURCE_MODEL=${1:-"$ROOT/weights/vibevoice-1.5b-es-corrected"}
+SOURCE_MODEL=${1:-"$ROOT/weights/vibevoice-1.5b-es"}
 OUTPUT_DIR=${2:-"$ROOT/weights/vibevoice-1.5b-es-iq4_nl"}
 OUTPUT_MODEL="$OUTPUT_DIR/vibevoice-1.5b-iq4_nl.gguf"
 MANIFEST="$OUTPUT_DIR/manifest.json"
+STAGING_DIR="$OUTPUT_DIR.partial"
 
 CRISP_VERSION=v0.8.23
 CRISP_COMMIT=d80ed4b98b52062264c278320b1c0889603f0034
@@ -18,12 +19,12 @@ RUNTIME_SHA256=6eda215837da0ffbbd5f362945b0197ea81d9e29b7fd5e9889dc237e222539ac
 
 echo "[S2-02] Construccion selectiva VibeVoice IQ4_NL con CrispASR"
 if [[ ! -f "$SOURCE_MODEL/config.json" ]] || ! compgen -G "$SOURCE_MODEL/*.safetensors" >/dev/null; then
-    echo "ERROR: falta el checkpoint corregido: $SOURCE_MODEL" >&2
-    echo "Ejecute S1.5-03, S1.5-05 y apruebe S1.5-07 antes de Sprint 2." >&2
+    echo "ERROR: falta el checkpoint canonico: $SOURCE_MODEL" >&2
+    echo "Complete Sprint 1 y apruebe S1.5-07 antes de Sprint 2." >&2
     exit 2
 fi
 
-mkdir -p "$ROOT/.cache" "$OUTPUT_DIR"
+mkdir -p "$ROOT/.cache" "$(dirname "$OUTPUT_DIR")"
 
 if [[ ! -d "$CRISP_SOURCE/.git" ]]; then
     git clone --recursive https://github.com/CrispStrobe/CrispASR.git "$CRISP_SOURCE"
@@ -62,8 +63,12 @@ if [[ -f "$OUTPUT_MODEL" ]] && [[ "${FORCE:-0}" != "1" ]]; then
     exit 0
 fi
 
-F16_MODEL="$OUTPUT_DIR/.vibevoice-1.5b-es-f16.gguf"
-PARTIAL_MODEL="$OUTPUT_MODEL.partial"
+rm -rf "$STAGING_DIR"
+mkdir -p "$STAGING_DIR"
+STAGING_MODEL="$STAGING_DIR/vibevoice-1.5b-iq4_nl.gguf"
+STAGING_MANIFEST="$STAGING_DIR/manifest.json"
+F16_MODEL="$STAGING_DIR/.vibevoice-1.5b-es-f16.gguf"
+PARTIAL_MODEL="$STAGING_MODEL.partial"
 cleanup() { rm -f "$F16_MODEL" "$PARTIAL_MODEL"; }
 trap cleanup EXIT
 
@@ -79,9 +84,12 @@ env -u CRISPASR_VIBEVOICE_QUANT_ALL -u CRISPASR_QUANT_LMHEAD \
 
 "$PYTHON_BIN" "$ROOT/scripts/validate_vibevoice_gguf.py" "$PARTIAL_MODEL" \
     --gguf-python "$CRISP_SOURCE/ggml/python" --source "$SOURCE_MODEL"
-mv "$PARTIAL_MODEL" "$OUTPUT_MODEL"
-"$PYTHON_BIN" "$ROOT/scripts/validate_vibevoice_gguf.py" "$OUTPUT_MODEL" \
-    --gguf-python "$CRISP_SOURCE/ggml/python" --manifest "$MANIFEST" --source "$SOURCE_MODEL"
+mv "$PARTIAL_MODEL" "$STAGING_MODEL"
+"$PYTHON_BIN" "$ROOT/scripts/validate_vibevoice_gguf.py" "$STAGING_MODEL" \
+    --gguf-python "$CRISP_SOURCE/ggml/python" --manifest "$STAGING_MANIFEST" --source "$SOURCE_MODEL"
 
-printf '%s\n' "$CRISPASR_BIN" > "$OUTPUT_DIR/crispasr-runtime.txt"
+rm -f "$F16_MODEL"
+printf '%s\n' "$CRISPASR_BIN" > "$STAGING_DIR/crispasr-runtime.txt"
+rm -rf "$OUTPUT_DIR"
+mv "$STAGING_DIR" "$OUTPUT_DIR"
 echo "Modelo guardado: $OUTPUT_MODEL"

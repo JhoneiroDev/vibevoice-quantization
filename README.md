@@ -14,13 +14,13 @@ Este proyecto constituye el marco experimental de una tesis que evalua tres tecn
 |--------|---------|--------|
 | **Sprint 1** | Infraestructura de datos y set de calibracion | Completado |
 | **Sprint 1.5** | Primera adaptacion monolingue: LoRA + diffusion head | Completado; gate con voz WER=0.2321 |
-| **Sprint 2** | GGUF IQ4_NL selectivo + runtime C++ CrispASR | Implementado, espera checkpoint corregido |
+| **Sprint 2** | GGUF IQ4_NL selectivo + runtime C++ CrispASR | Implementado; build canonico pendiente |
 | **Sprint 2.5** | Analisis de arquitectura y diagnostico de fallos | Completado |
-| **Sprint 3** | GPTQ W4 g128 selectivo con loader hibrido Triton | Implementado, espera checkpoint corregido |
-| **Sprint 4** | AWQ W4A16 g128 selectivo con AutoAWQ/Triton | Implementado, espera checkpoint corregido |
-| **Sprint 5** | INT8 selectiva (Fabio Sarracino + HelpfulHand3) | Pendiente |
-| **Sprint 6** | NF4 + double quant (DevParker/Dubedo + Soniqo) | Implementado, benchmark pendiente |
-| **Sprint 7** | FP8 E4M3FN dinamico (Zhao-Kun + CyberVoice) | Implementado, benchmark pendiente |
+| **Sprint 3** | GPTQ W4 g128 selectivo con loader hibrido Triton | Implementado; build canonico pendiente |
+| **Sprint 4** | AWQ W4A16 g128 selectivo con AutoAWQ/Triton | Implementado; build canonico pendiente |
+| **Sprint 5** | INT8 selectiva (Fabio Sarracino + HelpfulHand3) | Validado; WER=0.1409, pico=3.99 GiB |
+| **Sprint 6** | NF4 + double quant (DevParker/Dubedo + Soniqo) | Rechazado por gate; WER=0.3304 |
+| **Sprint 7** | FP8 E4M3FN dinamico (Zhao-Kun + CyberVoice) | No compatible con RTX 4060 Ti (`_scaled_mm`) |
 | **Sprint 8** | 🏁 Benchmark: 6 modelos + validacion estadistica | Pendiente |
 
 Ver [`docs/quantization_architecture_analysis.md`](docs/quantization_architecture_analysis.md) para el analisis completo de la arquitectura, compatibilidad con GPTQ/AWQ, y diagnostico de fallos previos.

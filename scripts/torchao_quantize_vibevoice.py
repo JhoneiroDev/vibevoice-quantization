@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Build and quality-gate selective bitsandbytes VibeVoice artifacts."""
+"""Build and quality-gate selective TorchAO W4A16 VibeVoice artifacts."""
 
 from __future__ import annotations
 
 import gc
+import importlib.metadata
 import json
 import sys
 import time
@@ -16,8 +17,8 @@ import soundfile as sf
 import torch
 import transformers
 import whisper
-from bitsandbytes.nn import Linear4bit, Linear8bitLt
-from transformers import BitsAndBytesConfig
+from torchao.quantization import Int4WeightOnlyConfig
+from transformers import TorchAoConfig
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,87 +59,69 @@ except ModuleNotFoundError:  # noqa: E402
 
 
 SOURCE = ROOT / "weights" / "vibevoice-1.5b-es"
+FINAL = ROOT / "weights" / "vibevoice-1.5b-es-torchao-int4"
+PARTIAL = FINAL.with_name(FINAL.name + ".partial")
+OUTPUT = ROOT / "outputs" / "sprint2_torchao_int4"
 VOICE = REPO / "demo" / "voices" / "en-Alice_woman.wav"
 TARGET_SR = 24000
 MAX_WER = 0.30
+TORCHAO_VERSION = "0.18.0"
+GROUP_SIZE = 128
+PACKING_FORMAT = "tile_packed_to_4d"
+QPARAMS_ALGORITHM = "hqq"
+QUANTIZED_WEIGHT_TYPE = "Int4TilePackedTo4dTensor"
 SENSITIVE_MODULES = [
-    "embed_tokens",
+    "model.language_model.embed_tokens",
     "lm_head",
-    "prediction_head",
-    "acoustic_tokenizer",
-    "semantic_tokenizer",
-    "acoustic_connector",
-    "semantic_connector",
+    "model.prediction_head",
+    "model.acoustic_tokenizer",
+    "model.semantic_tokenizer",
+    "model.acoustic_connector",
+    "model.semantic_connector",
 ]
 
 
-def _configuration(mode: str) -> tuple[BitsAndBytesConfig, type, torch.dtype]:
-    if mode == "int8":
-        return (
-            BitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=6.0,
-                llm_int8_has_fp16_weight=False,
-                llm_int8_enable_fp32_cpu_offload=False,
-                llm_int8_skip_modules=SENSITIVE_MODULES,
-            ),
-            Linear8bitLt,
-            torch.bfloat16,
-        )
-    if mode == "nf4":
-        return (
-            BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_quant_storage=torch.uint8,
-                llm_int8_skip_modules=SENSITIVE_MODULES,
-            ),
-            Linear4bit,
-            torch.bfloat16,
-        )
-    raise ValueError(f"Unsupported bitsandbytes mode: {mode}")
+def _configuration() -> TorchAoConfig:
+    return TorchAoConfig(
+        Int4WeightOnlyConfig(
+            group_size=GROUP_SIZE,
+            int4_packing_format=PACKING_FORMAT,
+            int4_choose_qparams_algorithm=QPARAMS_ALGORITHM,
+        ),
+        modules_to_not_convert=SENSITIVE_MODULES,
+    )
 
 
-def _validate_modules(model, module_type: type, mode: str) -> list[str]:
-    modules = {
-        name: module
-        for name, module in model.named_modules()
-        if isinstance(module, module_type)
-    }
-    expected_shapes = {
+def _validate_modules(model) -> list[str]:
+    expected = {
         name.removesuffix(".weight"): shape
         for name, shape in expected_qwen_weights().items()
     }
-    if set(modules) != set(expected_shapes):
+    modules = {
+        name: module
+        for name, module in model.named_modules()
+        if isinstance(module, torch.nn.Linear)
+        and type(module.weight).__name__ == QUANTIZED_WEIGHT_TYPE
+    }
+    if set(modules) != set(expected):
         raise AssertionError(
-            f"Invalid {mode.upper()} targets: "
-            f"missing={sorted(set(expected_shapes) - set(modules))[:5]}, "
-            f"unexpected={sorted(set(modules) - set(expected_shapes))[:5]}"
+            "Invalid TorchAO INT4 targets: "
+            f"missing={sorted(set(expected) - set(modules))[:5]}, "
+            f"unexpected={sorted(set(modules) - set(expected))[:5]}"
         )
-    bad_shapes = [
-        (name, module.out_features, module.in_features)
+    invalid_shapes = [
+        (name, tuple(module.weight.shape))
         for name, module in modules.items()
-        if (module.out_features, module.in_features) != expected_shapes[name]
+        if tuple(module.weight.shape) != expected[name]
     ]
-    if bad_shapes:
-        raise AssertionError(f"Invalid {mode.upper()} module shapes: {bad_shapes[:5]}")
-
+    if invalid_shapes:
+        raise AssertionError(f"Invalid TorchAO INT4 shapes: {invalid_shapes[:5]}")
     for name, module in modules.items():
-        if mode == "nf4":
-            state = module.weight.quant_state
-            if state is None or not state.nested or module.compute_dtype != torch.bfloat16:
-                raise AssertionError(f"Invalid NF4/Double Quant state: {name}")
-            if not torch.isfinite(state.absmax.float()).all():
-                raise AssertionError(f"Non-finite NF4 scales: {name}")
-        else:
-            scale = getattr(module.weight, "SCB", None)
-            if scale is not None and not torch.isfinite(scale.float()).all():
-                raise AssertionError(f"Non-finite INT8 scales: {name}")
+        if not torch.isfinite(module.weight.dequantize()).all():
+            raise AssertionError(f"Non-finite TorchAO INT4 weight: {name}")
 
     embedding = model.model.language_model.embed_tokens.weight
-    if embedding.dtype not in {torch.float16, torch.bfloat16}:
+    if embedding.dtype != torch.bfloat16:
         raise AssertionError(f"embed_tokens has unexpected dtype: {embedding.dtype}")
     if model.lm_head.weight.data_ptr() != embedding.data_ptr():
         raise AssertionError("lm_head and embed_tokens are not tied")
@@ -153,90 +136,72 @@ def _artifact_inventory(path: Path) -> dict[str, dict[str, int | str]]:
     }
 
 
-def _validate_existing(path: Path, mode: str) -> dict:
-    manifest_path = path / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("schema") != "vibevoice-selective-bnb-v1":
-        raise ValueError(f"Unsupported bitsandbytes artifact: {path}")
+def _validate_existing(path: Path) -> dict:
+    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("schema") != "vibevoice-selective-torchao-int4-v1":
+        raise ValueError(f"Unsupported TorchAO artifact: {path}")
     validate_manifest_source(manifest)
     if manifest.get("status") != "validated":
         raise ValueError(f"Artifact is not validated: {manifest.get('status')}")
-    if manifest.get("quantization", {}).get("type") != mode:
-        raise ValueError(f"Artifact mode does not match {mode}: {path}")
     if manifest.get("artifacts") != _artifact_inventory(path):
         raise ValueError(f"Artifact hashes do not match manifest: {path}")
     if manifest.get("validation", {}).get("quantized_modules") != 196:
-        raise ValueError(f"Artifact does not contain 196 validated modules: {path}")
+        raise ValueError("TorchAO artifact does not contain 196 validated modules")
     return manifest
 
 
-def run(mode: str) -> None:
-    assert torch.cuda.is_available(), "INT8/NF4 requires a CUDA GPU"
+def run() -> None:
+    if importlib.metadata.version("torchao") != TORCHAO_VERSION:
+        raise RuntimeError(f"Sprint 2 requires torchao=={TORCHAO_VERSION}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("TorchAO W4A16 requires a CUDA GPU")
     gate = validate_canonical_source(SOURCE)
     if not VOICE.is_file():
         raise FileNotFoundError(f"Missing fixed voice sample: {VOICE}")
+    OUTPUT.mkdir(parents=True, exist_ok=True)
 
-    bnb_config, module_type, model_dtype = _configuration(mode)
-    final = ROOT / "weights" / f"vibevoice-1.5b-es-{mode}"
-    partial = final.with_name(final.name + ".partial")
-    output = ROOT / "outputs" / f"sprint{5 if mode == 'int8' else 6}_{mode}"
-    output.mkdir(parents=True, exist_ok=True)
-    if final.is_dir():
-        manifest = _validate_existing(final, mode)
-        atomic_json(output / "metrics.json", manifest["validation"]["quality"])
-        print(f"Validated existing {mode.upper()} artifact: {final}")
+    if FINAL.is_dir():
+        manifest = _validate_existing(FINAL)
+        atomic_json(OUTPUT / "metrics.json", manifest["validation"]["quality"])
+        print(f"Validated existing TorchAO INT4 artifact: {FINAL}")
         return
-    if final.exists():
-        raise FileExistsError(f"Existing {mode.upper()} artifact will not be overwritten: {final}")
-    if partial.exists():
+    if PARTIAL.exists():
         raise FileExistsError(
-            f"Existing {mode.upper()} candidate requires manual review or removal: {partial}"
+            f"Existing TorchAO candidate requires manual review or removal: {PARTIAL}"
         )
 
-    print(f"Loading canonical VibeVoice-ES with selective {mode.upper()}...")
     model = VibeVoiceForConditionalGenerationInference.from_pretrained(
         SOURCE,
-        quantization_config=bnb_config,
-        torch_dtype=model_dtype,
+        quantization_config=_configuration(),
+        torch_dtype=torch.bfloat16,
         device_map={"": "cuda:0"},
         attn_implementation="sdpa",
         local_files_only=True,
     )
     model.eval()
     model.set_ddpm_inference_steps(num_steps=20)
-    names = _validate_modules(model, module_type, mode)
-    quantized_modules = [
-        module for module in model.modules() if isinstance(module, module_type)
-    ]
-    quantized_weight_ids = {id(module.weight) for module in quantized_modules}
-    quantized_params = sum(
-        module.in_features * module.out_features for module in quantized_modules
-    )
-    protected_params = sum(
-        parameter.numel()
-        for parameter in model.parameters()
-        if id(parameter) not in quantized_weight_ids
-    )
-    total_params = protected_params + quantized_params
+    names = _validate_modules(model)
+    quantized_params = sum(np.prod(shape) for shape in expected_qwen_weights().values())
+    total_params = sum(parameter.numel() for parameter in model.parameters())
 
-    model.save_pretrained(partial, safe_serialization=True, max_shard_size="4GB")
+    model.save_pretrained(PARTIAL, safe_serialization=False, max_shard_size="4GB")
     processor = VibeVoiceProcessor.from_pretrained(SOURCE, local_files_only=True)
-    processor.save_pretrained(partial)
+    processor.save_pretrained(PARTIAL)
     del model
     gc.collect()
     torch.cuda.empty_cache()
 
     reloaded = VibeVoiceForConditionalGenerationInference.from_pretrained(
-        partial,
+        PARTIAL,
         device_map={"": "cuda:0"},
         attn_implementation="sdpa",
         local_files_only=True,
+        weights_only=False,
     )
     reloaded.eval()
     reloaded.set_ddpm_inference_steps(num_steps=20)
-    reloaded_names = _validate_modules(reloaded, module_type, mode)
-    if reloaded_names != names:
-        raise AssertionError(f"{mode.upper()} target set changed after reload")
+    if _validate_modules(reloaded) != names:
+        raise AssertionError("TorchAO target set changed after reload")
 
     idle_vram = torch.cuda.memory_allocated() / 1024**3
     peak_vram = idle_vram
@@ -269,19 +234,19 @@ def run(mode: str) -> None:
             )
         elapsed = time.perf_counter() - started
         if not generated.speech_outputs or generated.speech_outputs[0] is None:
-            raise RuntimeError(f"No {mode.upper()} audio produced for sample {index}")
+            raise RuntimeError(f"No TorchAO INT4 audio produced for sample {index}")
         audio = generated.speech_outputs[0].squeeze().float().cpu().numpy()
         if not np.isfinite(audio).all():
-            raise RuntimeError(f"Non-finite {mode.upper()} audio for sample {index}")
+            raise RuntimeError(f"Non-finite TorchAO INT4 audio for sample {index}")
         duration = len(audio) / TARGET_SR
         if duration <= 0:
-            raise RuntimeError(f"Empty {mode.upper()} audio for sample {index}")
+            raise RuntimeError(f"Empty TorchAO INT4 audio for sample {index}")
         rtfs.append(elapsed / duration)
         peak_vram = max(peak_vram, torch.cuda.max_memory_allocated() / 1024**3)
-        wav = output / f"sample_{index:02d}.wav"
-        temporary_wav = wav.with_suffix(".wav.partial")
-        sf.write(temporary_wav, audio, TARGET_SR, subtype="PCM_16", format="WAV")
-        temporary_wav.replace(wav)
+        wav = OUTPUT / f"sample_{index:02d}.wav"
+        temporary = wav.with_suffix(".wav.partial")
+        sf.write(temporary, audio, TARGET_SR, subtype="PCM_16", format="WAV")
+        temporary.replace(wav)
         wav_paths.append(wav)
 
     del reloaded, generated, inputs, processor
@@ -316,13 +281,17 @@ def run(mode: str) -> None:
 
     wer = float(np.mean([sample["wer"] for sample in samples]))
     metrics = {
-        "model": str(final.resolve()),
+        "model": str(FINAL.resolve()),
         "source": str(SOURCE.resolve()),
         "source_hashes": source_hashes(SOURCE),
         "source_gate_wer": gate["wer"],
-        "quantization": mode,
+        "quantization": "TorchAO W4A16 HQQ g128",
         "quantized_modules": len(names),
         "quantized_parameter_fraction": quantized_params / total_params,
+        "disk_gib": sum(
+            file.stat().st_size for file in PARTIAL.rglob("*") if file.is_file()
+        )
+        / 1024**3,
         "vram_idle_gib": idle_vram,
         "vram_peak_gib": peak_vram,
         "rtf": float(np.mean(rtfs)),
@@ -332,31 +301,36 @@ def run(mode: str) -> None:
         "passed": wer <= MAX_WER,
         "samples": samples,
     }
-    atomic_json(output / "metrics.json", metrics)
+    atomic_json(OUTPUT / "metrics.json", metrics)
     manifest = {
-        "schema": "vibevoice-selective-bnb-v1",
+        "schema": "vibevoice-selective-torchao-int4-v1",
         "status": "validated" if metrics["passed"] else "quality_failed",
         "source": str(SOURCE.resolve()),
         "source_hashes": source_hashes(SOURCE),
         "quantization": {
-            "type": mode,
+            "type": "W4A16",
+            "algorithm": QPARAMS_ALGORITHM,
+            "group_size": GROUP_SIZE,
+            "packing_format": PACKING_FORMAT,
+            "torchao_version": TORCHAO_VERSION,
             "expected_modules": 196,
-            "double_quant": mode == "nf4",
-            "compute_dtype": str(model_dtype),
+            "compute_dtype": "torch.bfloat16",
         },
-        "artifacts": _artifact_inventory(partial),
+        "artifacts": _artifact_inventory(PARTIAL),
         "validation": {
             "quantized_modules": len(names),
             "reload_verified": True,
             "quality": metrics,
         },
     }
-    atomic_json(partial / "manifest.json", manifest)
+    atomic_json(PARTIAL / "manifest.json", manifest)
     if not metrics["passed"]:
-        print(
-            f"{mode.upper()} candidate was not promoted: "
-            f"WER {wer:.4f} > {MAX_WER:.4f}"
+        raise RuntimeError(
+            f"TorchAO candidate not promoted: WER {wer:.4f} > {MAX_WER:.4f}"
         )
-        return
-    partial.replace(final)
+    PARTIAL.replace(FINAL)
     print(json.dumps(metrics, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    run()

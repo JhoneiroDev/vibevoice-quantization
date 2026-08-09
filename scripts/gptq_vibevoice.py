@@ -161,9 +161,8 @@ def build_calibration(tokenizer, metadata_path: Path, output_path: Path, sequenc
 def prepare(source: Path, output: Path, metadata: Path, force: bool) -> None:
     validate_canonical_source(source)
     if output.exists():
-        if not force:
-            raise FileExistsError(f"Output exists: {output}; pass --force to rebuild")
-        shutil.rmtree(output)
+        suffix = "; --force does not delete artifacts" if force else ""
+        raise FileExistsError(f"Output requires manual review or removal: {output}{suffix}")
 
     work = output / ".work" / "decoder-bf16"
     protected_dir = output / "protected"

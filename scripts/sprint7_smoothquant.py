@@ -88,8 +88,12 @@ def main() -> None:
     if not hasattr(torch, "_int_mm"):
         raise RuntimeError("This PyTorch does not expose torch._int_mm")
     print(f"GPU: {torch.cuda.get_device_name(0)} | kernel: torch._int_mm")
+    if FINAL.exists():
+        raise FileExistsError(f"Existing SmoothQuant artifact will not be overwritten: {FINAL}")
     if PARTIAL.exists():
-        shutil.rmtree(PARTIAL)
+        raise FileExistsError(
+            f"Existing SmoothQuant candidate requires manual review or removal: {PARTIAL}"
+        )
 
     model = VibeVoiceForConditionalGenerationInference.from_pretrained(
         MODEL, torch_dtype=torch.bfloat16, device_map={"": "cuda:0"},
@@ -221,8 +225,6 @@ def main() -> None:
     if not metrics["passed"]:
         print(f"SmoothQuant no fue promovido: WER={wer:.4f} > {MAX_WER:.4f}")
         return
-    if FINAL.exists():
-        shutil.rmtree(FINAL)
     PARTIAL.replace(FINAL)
     print(json.dumps(metrics, indent=2, ensure_ascii=False))
 

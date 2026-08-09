@@ -120,7 +120,12 @@ def run_persistent_job(
         status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.is_file() else {}
         if status.get("state") in {"completed", "failed"}:
             break
-        if not _process_active(pid):
+        active = process.poll() is None if process is not None else _process_active(pid)
+        if not active:
+            # The worker can finish between the status read and the process check.
+            status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.is_file() else {}
+            if status.get("state") in {"completed", "failed"}:
+                break
             raise RuntimeError(f"[{name}] worker desaparecio sin estado final. Log:\n{_tail(log_path)}")
         time.sleep(10)
         if time.monotonic() - last_report >= report_seconds:
@@ -150,10 +155,13 @@ def worker(spec_path: Path) -> int:
         "started_at": time.time(),
     }
     _atomic_json(status_path, status)
+    environment = os.environ.copy()
+    environment.setdefault("PYTHON_BIN", sys.executable)
     with log_path.open("ab", buffering=0) as log:
         result = subprocess.run(
             spec["command"],
             cwd=spec["cwd"],
+            env=environment,
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,

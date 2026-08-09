@@ -6,6 +6,7 @@ from __future__ import annotations
 import gc
 import importlib.metadata
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -18,6 +19,10 @@ import torch
 import transformers
 import whisper
 from torchao.quantization import Int4WeightOnlyConfig
+from torchao.quantization.quantize_.workflows import (
+    Int4ChooseQParamsAlgorithm,
+    Int4PackingFormat,
+)
 from transformers import TorchAoConfig
 
 
@@ -67,8 +72,8 @@ TARGET_SR = 24000
 MAX_WER = 0.30
 TORCHAO_VERSION = "0.18.0"
 GROUP_SIZE = 128
-PACKING_FORMAT = "tile_packed_to_4d"
-QPARAMS_ALGORITHM = "hqq"
+PACKING_FORMAT = Int4PackingFormat.TILE_PACKED_TO_4D
+QPARAMS_ALGORITHM = Int4ChooseQParamsAlgorithm.HQQ
 QUANTIZED_WEIGHT_TYPE = "Int4TilePackedTo4dTensor"
 SENSITIVE_MODULES = [
     "model.language_model.embed_tokens",
@@ -90,6 +95,15 @@ def _configuration() -> TorchAoConfig:
         ),
         modules_to_not_convert=SENSITIVE_MODULES,
     )
+
+
+def _cast_unquantized_to_bfloat16(model) -> None:
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if type(parameter).__name__ == QUANTIZED_WEIGHT_TYPE:
+                continue
+            if parameter.is_floating_point() and parameter.dtype != torch.bfloat16:
+                parameter.data = parameter.data.to(dtype=torch.bfloat16)
 
 
 def _validate_modules(model) -> list[str]:
@@ -116,15 +130,49 @@ def _validate_modules(model) -> list[str]:
     ]
     if invalid_shapes:
         raise AssertionError(f"Invalid TorchAO INT4 shapes: {invalid_shapes[:5]}")
+    probed_shapes = set()
     for name, module in modules.items():
-        if not torch.isfinite(module.weight.dequantize()).all():
-            raise AssertionError(f"Non-finite TorchAO INT4 weight: {name}")
+        weight = module.weight
+        if weight.qdata.dtype != torch.int32 or not weight.qdata.is_contiguous():
+            raise AssertionError(f"Invalid packed TorchAO INT4 data: {name}")
+        if (
+            weight.scale_and_zero.dtype != torch.bfloat16
+            or not weight.scale_and_zero.is_contiguous()
+            or not torch.isfinite(weight.scale_and_zero).all()
+        ):
+            raise AssertionError(f"Invalid TorchAO INT4 scales or zeros: {name}")
+        if list(weight.block_size) != [1, GROUP_SIZE]:
+            raise AssertionError(f"Invalid TorchAO INT4 block size: {name}")
+        if weight.act_pre_scale is not None and not torch.isfinite(weight.act_pre_scale).all():
+            raise AssertionError(f"Invalid TorchAO INT4 activation scale: {name}")
+
+        shape = (module.in_features, module.out_features)
+        if shape not in probed_shapes:
+            probe = torch.zeros(
+                1, module.in_features, dtype=torch.bfloat16, device=weight.device
+            )
+            with torch.inference_mode():
+                output = module(probe)
+            if output.dtype != torch.bfloat16 or not torch.isfinite(output).all():
+                raise AssertionError(f"Invalid TorchAO INT4 kernel output: {name}")
+            probed_shapes.add(shape)
 
     embedding = model.model.language_model.embed_tokens.weight
     if embedding.dtype != torch.bfloat16:
         raise AssertionError(f"embed_tokens has unexpected dtype: {embedding.dtype}")
     if model.lm_head.weight.data_ptr() != embedding.data_ptr():
         raise AssertionError("lm_head and embed_tokens are not tied")
+    invalid_dense_dtypes = [
+        (name, str(parameter.dtype))
+        for name, parameter in model.named_parameters()
+        if type(parameter).__name__ != QUANTIZED_WEIGHT_TYPE
+        and parameter.is_floating_point()
+        and parameter.dtype != torch.bfloat16
+    ]
+    if invalid_dense_dtypes:
+        raise AssertionError(
+            f"Non-quantized parameters are not BF16: {invalid_dense_dtypes[:5]}"
+        )
     return sorted(modules)
 
 
@@ -165,34 +213,36 @@ def run() -> None:
         atomic_json(OUTPUT / "metrics.json", manifest["validation"]["quality"])
         print(f"Validated existing TorchAO INT4 artifact: {FINAL}")
         return
+    names = None
     if PARTIAL.exists():
-        raise FileExistsError(
-            f"Existing TorchAO candidate requires manual review or removal: {PARTIAL}"
+        if (PARTIAL / "manifest.json").exists():
+            raise FileExistsError(
+                f"Existing evaluated TorchAO candidate requires manual review: {PARTIAL}"
+            )
+        print(f"Resuming saved TorchAO candidate without requantizing: {PARTIAL}")
+    else:
+        model = VibeVoiceForConditionalGenerationInference.from_pretrained(
+            SOURCE,
+            quantization_config=_configuration(),
+            torch_dtype=torch.bfloat16,
+            device_map={"": "cuda:0"},
+            attn_implementation="sdpa",
+            local_files_only=True,
         )
-
-    model = VibeVoiceForConditionalGenerationInference.from_pretrained(
-        SOURCE,
-        quantization_config=_configuration(),
-        torch_dtype=torch.bfloat16,
-        device_map={"": "cuda:0"},
-        attn_implementation="sdpa",
-        local_files_only=True,
-    )
-    model.eval()
-    model.set_ddpm_inference_steps(num_steps=20)
-    names = _validate_modules(model)
-    quantized_params = sum(np.prod(shape) for shape in expected_qwen_weights().values())
-    total_params = sum(parameter.numel() for parameter in model.parameters())
-
-    model.save_pretrained(PARTIAL, safe_serialization=False, max_shard_size="4GB")
-    processor = VibeVoiceProcessor.from_pretrained(SOURCE, local_files_only=True)
-    processor.save_pretrained(PARTIAL)
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
+        model.eval()
+        model.set_ddpm_inference_steps(num_steps=20)
+        _cast_unquantized_to_bfloat16(model)
+        names = _validate_modules(model)
+        model.save_pretrained(PARTIAL, safe_serialization=False, max_shard_size="4GB")
+        processor = VibeVoiceProcessor.from_pretrained(SOURCE, local_files_only=True)
+        processor.save_pretrained(PARTIAL)
+        del model, processor
+        gc.collect()
+        torch.cuda.empty_cache()
 
     reloaded = VibeVoiceForConditionalGenerationInference.from_pretrained(
         PARTIAL,
+        torch_dtype=torch.bfloat16,
         device_map={"": "cuda:0"},
         attn_implementation="sdpa",
         local_files_only=True,
@@ -200,8 +250,17 @@ def run() -> None:
     )
     reloaded.eval()
     reloaded.set_ddpm_inference_steps(num_steps=20)
-    if _validate_modules(reloaded) != names:
+    _cast_unquantized_to_bfloat16(reloaded)
+    reloaded_names = _validate_modules(reloaded)
+    if names is not None and reloaded_names != names:
         raise AssertionError("TorchAO target set changed after reload")
+    names = reloaded_names
+    shutil.copy2(
+        SOURCE / "preprocessor_config.json", PARTIAL / "preprocessor_config.json"
+    )
+    processor = VibeVoiceProcessor.from_pretrained(PARTIAL, local_files_only=True)
+    quantized_params = sum(np.prod(shape) for shape in expected_qwen_weights().values())
+    total_params = sum(parameter.numel() for parameter in reloaded.parameters())
 
     idle_vram = torch.cuda.memory_allocated() / 1024**3
     peak_vram = idle_vram
@@ -309,9 +368,9 @@ def run() -> None:
         "source_hashes": source_hashes(SOURCE),
         "quantization": {
             "type": "W4A16",
-            "algorithm": QPARAMS_ALGORITHM,
+            "algorithm": QPARAMS_ALGORITHM.value,
             "group_size": GROUP_SIZE,
-            "packing_format": PACKING_FORMAT,
+            "packing_format": PACKING_FORMAT.value,
             "torchao_version": TORCHAO_VERSION,
             "expected_modules": 196,
             "compute_dtype": "torch.bfloat16",

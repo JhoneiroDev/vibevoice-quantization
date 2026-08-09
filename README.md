@@ -20,8 +20,8 @@ Este proyecto constituye el marco experimental de una tesis que evalua seis tecn
 | **Sprint 4** | AWQ W4A16 g128 selectivo con AutoAWQ/Triton | Rechazado por gate; WER=0.3095 |
 | **Sprint 5** | INT8 selectiva (Fabio Sarracino + HelpfulHand3) | Validado; WER=0.1409, pico=5.18 GiB |
 | **Sprint 6** | NF4 + double quant (DevParker/Dubedo + Soniqo) | Rechazado por gate; WER=0.3304 |
-| **Sprint 7** | SmoothQuant W8A8 selectivo sobre Qwen2 | Validado; WER=0.1518, pico=3.96 GiB |
-| **Sprint 8** | 🏁 Benchmark: 7 modelos + validacion estadistica | Pendiente |
+| **Sprint 7** | SmoothQuant W8A8 selectivo sobre Qwen2 | Validado; WER=0.0685, pico=3.96 GiB |
+| **Sprint 8** | 🏁 Benchmark: 7 modelos + validacion estadistica | Completado; resultados en `outputs/sprint8_benchmark/` |
 
 Ver [`docs/quantization_architecture_analysis.md`](docs/quantization_architecture_analysis.md) para el analisis completo de la arquitectura, compatibilidad con GPTQ/AWQ, y diagnostico de fallos previos.
 
@@ -203,7 +203,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 | **AWQ** ($X_3$) | Proteccion de canales W4A16 g128, Qwen-only | AutoAWQ/Triton | Rechazado; WER=0.3095 |
 | **INT8** | Selectiva LLM-only | bitsandbytes | Validado; WER=0.1409, pico=5.18 GiB, RTF=2.3380 |
 | **NF4** | NormalFloat4 + double quant selectivo | bitsandbytes | Rechazado; WER=0.3304 |
-| **SmoothQuant** | W8A8 selectivo, salida BF16 | `torch._int_mm` | Validado; 3.83 GiB idle, 3.96 GiB pico, WER=0.1518 |
+| **SmoothQuant** | W8A8 selectivo, salida BF16 | `torch._int_mm` | Validado; 3.83 GiB idle, 3.96 GiB pico, WER=0.0685 |
 
 ### Tabla Comparativa Final (Sprint 8 — Benchmark)
 
@@ -215,7 +215,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 | AWQ W4A16 g128 | 3.39 | 1.3181 | 0.3095 | 0.2352 | — |
 | INT8 | 5.18 | 2.3380 | 0.1409 | 0.1118 | — |
 | NF4 W4A16 double quant | 4.01 | 1.3215 | 0.3304 | 0.2056 | — |
-| SmoothQuant W8A8 | 3.96 | 1.5632 | 0.1518 | 0.0884 | — |
+| SmoothQuant W8A8 | 4.04 | 1.5988 | 0.0685 | 0.0419 | — |
 
 ## Metricas de Evaluacion
 
@@ -233,6 +233,23 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 ### Validacion Estadistica (Sprint 5)
 - Prueba de normalidad: Shapiro-Wilk
 - Prueba no parametrica pareada: Wilcoxon signed-rank para validar $H_1$ (superioridad del modelo hibrido propuesto)
+
+### Benchmark Final (Sprint 8)
+
+El benchmark reproducible se ejecuta con `scripts/sprint8_benchmark.py`. Cada variante se recarga en un proceso independiente usando seis textos fijos, la voz `en-Alice_woman.wav` y Whisper large-v3. Los resultados completos, muestras individuales, IC95 bootstrap, CSV y tabla Markdown estan en `outputs/sprint8_benchmark/`.
+
+| Modelo | Estado | VRAM pico (GiB) | RTF | WER | CER |
+|---|---|---:|---:|---:|---:|
+| FP16 | baseline | 5.18 | 0.9475 | 0.2321 | 0.1546 |
+| TorchAO INT4 | validado | 3.55 | 1.0133 | 0.1845 | 0.1019 |
+| GPTQ TTS | rechazado | 3.37 | 1.1517 | 0.3423 | 0.1783 |
+| AWQ | rechazado | 3.39 | 1.2743 | 0.3571 | 0.2544 |
+| NF4 | rechazado | 3.37 | 1.1507 | 0.3095 | 0.1880 |
+| INT8 | validado | 3.98 | 2.3694 | 0.2083 | 0.1505 |
+| SmoothQuant | validado | 4.04 | 1.5988 | 0.0685 | 0.0419 |
+
+PESQ y MCD no se calculan porque el protocolo actual no contiene ondas de referencia emparejadas para los seis textos; se reportan todas las metricas validables sin inventar valores.
+`summary.json` incluye comparaciones pareadas contra FP16 mediante Shapiro-Wilk y Wilcoxon. Estas pruebas son exploratorias (`n=6`) y no sustituyen el benchmark estadistico ampliado del split `test`.
 
 ## Hardware de Desarrollo
 

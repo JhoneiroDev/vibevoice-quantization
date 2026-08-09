@@ -123,7 +123,11 @@ def replace_qwen_linears_with_smoothquant(
     return sorted(names)
 
 
-def collect_activation_scales(model, tokenizer, texts: list[str], device: str) -> dict[str, torch.Tensor]:
+def collect_activation_scales(
+    model,
+    prefill_embeddings: list[tuple[torch.Tensor, torch.Tensor]],
+    device: str,
+) -> dict[str, torch.Tensor]:
     maxima: dict[str, torch.Tensor] = {}
     handles = []
 
@@ -137,11 +141,17 @@ def collect_activation_scales(model, tokenizer, texts: list[str], device: str) -
     for name, module in model.named_modules():
         if name in TARGETS:
             handles.append(module.register_forward_hook(hook(name)))
-    encoded = [tokenizer(f"Speaker 1: {text}", return_tensors="pt") for text in texts]
+    encoded = [
+        {"input_ids": embeds, "attention_mask": mask}
+        for embeds, mask in prefill_embeddings
+    ]
     with torch.inference_mode():
         for item in encoded:
-            inputs = {key: value.to(device) for key, value in item.items()}
-            model.model.language_model(**inputs, use_cache=False)
+            model.model.language_model(
+                inputs_embeds=item["input_ids"].to(device),
+                attention_mask=item["attention_mask"].to(device),
+                use_cache=False,
+            )
     for handle in handles:
         handle.remove()
     if set(maxima) != TARGETS:

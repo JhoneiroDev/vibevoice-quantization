@@ -148,6 +148,8 @@ def validate_manifest_source(manifest: dict) -> Path:
     source = Path(source_value).resolve()
     validate_canonical_source(source)
     current = source_hashes(source)
-    if current != manifest.get("source_hashes"):
+    recorded = manifest.get("source_hashes")
+    legacy_current = {key: value for key, value in current.items() if key != "model.safetensors.index.json"}
+    if current != recorded and legacy_current != recorded:
         raise ValueError("Artifact source hashes do not match the canonical checkpoint")
     return source

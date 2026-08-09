@@ -100,7 +100,7 @@ class VibeVoiceProcessor:
             if os.path.isdir(local_tokenizer):
                 language_model_pretrained_name = local_tokenizer
         logger.info(f"Loading tokenizer from {language_model_pretrained_name}")
-        if 'qwen' in language_model_pretrained_name.lower():
+        if os.path.isdir(language_model_pretrained_name) or 'qwen' in language_model_pretrained_name.lower():
             tokenizer = VibeVoiceTextTokenizerFast.from_pretrained(
                 language_model_pretrained_name,
                 **kwargs

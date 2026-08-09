@@ -3,6 +3,8 @@
 """Fresh-process reload and TTS smoke test for the selective AWQ artifact."""
 
 import argparse
+import gc
+import hashlib
 import json
 import sys
 import time
@@ -21,29 +23,57 @@ if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 
 from awq.modules.linear.gemm import WQLinear_GEMM
-from awq_vibevoice import VibeVoiceProcessor, load_awq_vibevoice
+from awq_vibevoice import VibeVoiceProcessor, load_awq_vibevoice, validate
 from quantization_common import atomic_json
+from validate_vibevoice_es_quality import TEXTS, normalize
+
+
+VOICE = ROOT / "VibeVoice_repo" / "demo" / "voices" / "en-Alice_woman.wav"
+TARGET_SR = 24000
+PROTOCOL = "six-texts-en-Alice-large-v3-WER-0.30-v1"
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument(
-        "--text",
-        default="Hola, esta es una prueba de síntesis de voz en español.",
-    )
-    parser.add_argument("--max-wer", type=float, default=0.5)
+    parser.add_argument("--max-wer", type=float, default=0.30)
     args = parser.parse_args()
+    if args.max_wer != 0.30:
+        raise ValueError("The canonical AWQ quality gate requires --max-wer 0.30")
+    if not VOICE.is_file():
+        raise FileNotFoundError(f"Missing fixed voice sample: {VOICE}")
+    metrics_path = args.output.with_suffix(".json")
+    manifest_path = args.model / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    artifact_fingerprint = hashlib.sha256(
+        json.dumps(manifest.get("artifacts", {}), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    if metrics_path.is_file() and manifest.get("status") == "quality_failed":
+        existing = json.loads(metrics_path.read_text(encoding="utf-8"))
+        if (
+            existing.get("protocol") == PROTOCOL
+            and existing.get("awq_modules") == 196
+            and existing.get("max_wer") == args.max_wer
+            and existing.get("passed") is False
+            and existing.get("model") == str(args.model.resolve())
+            and existing.get("voice") == str(VOICE.resolve())
+            and existing.get("artifact_fingerprint") == artifact_fingerprint
+            and [sample.get("reference") for sample in existing.get("samples", [])]
+            == TEXTS
+            and manifest.get("smoke") == existing
+        ):
+            validate(args.model)
+            print("Existing AWQ quality rejection validated; generation not repeated")
+            print(json.dumps(existing, indent=2, ensure_ascii=False))
+            return
 
     torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
     load_start = time.perf_counter()
     model = load_awq_vibevoice(args.model, device="cuda:0")
     load_seconds = time.perf_counter() - load_start
-    processor = VibeVoiceProcessor.from_pretrained(
-        args.model, local_files_only=True
-    )
+    processor = VibeVoiceProcessor.from_pretrained(args.model, local_files_only=True)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
 
     hits = set()
     handles = []
@@ -51,63 +81,93 @@ def main():
         if isinstance(module, WQLinear_GEMM):
             handles.append(module.register_forward_hook(lambda _m, _i, _o, n=name: hits.add(n)))
 
-    inputs = processor(
-        text=[f"Speaker 1: {args.text}"],
-        voice_samples=None,
-        padding=True,
-        return_tensors="pt",
-        return_attention_mask=True,
-    )
-    inputs = {
-        key: value.to("cuda:0") if torch.is_tensor(value) else value
-        for key, value in inputs.items()
-        if value is not None
-    }
-    generation_start = time.perf_counter()
-    with torch.inference_mode():
-        output = model.generate(
-            **inputs,
-            max_new_tokens=600,
-            tokenizer=processor.tokenizer,
-            generation_config={"do_sample": False},
-            verbose=False,
+    peak_vram = torch.cuda.memory_allocated() / 1024**3
+    generation_seconds = []
+    durations = []
+    audio_stats = []
+    wav_paths = []
+    for index, text in enumerate(TEXTS, start=1):
+        torch.manual_seed(42 + index - 1)
+        inputs = processor(
+            text=[f"Speaker 1: {text}"],
+            voice_samples=[[str(VOICE)]],
+            padding=True,
+            return_tensors="pt",
+            return_attention_mask=True,
         )
-    generation_seconds = time.perf_counter() - generation_start
+        inputs = {
+            key: value.to("cuda:0") if torch.is_tensor(value) else value
+            for key, value in inputs.items()
+            if value is not None
+        }
+        torch.cuda.reset_peak_memory_stats()
+        started = time.perf_counter()
+        with torch.inference_mode():
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=600,
+                tokenizer=processor.tokenizer,
+                generation_config={"do_sample": False},
+                verbose=False,
+                is_prefill=True,
+            )
+        elapsed = time.perf_counter() - started
+        if not generated.speech_outputs or generated.speech_outputs[0] is None:
+            raise RuntimeError(f"AWQ produced no audio for sample {index}")
+        audio = generated.speech_outputs[0].squeeze().float().cpu().numpy()
+        if not np.isfinite(audio).all():
+            raise RuntimeError(f"AWQ produced NaN or Inf audio for sample {index}")
+        rms = float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
+        peak = float(np.max(np.abs(audio)))
+        if rms < 1e-5 or peak < 1e-4:
+            raise RuntimeError(f"AWQ produced silence for sample {index}: RMS={rms}, peak={peak}")
+        duration = len(audio) / TARGET_SR
+        wav = args.output if index == 1 else args.output.with_name(
+            f"{args.output.stem}-{index:02d}{args.output.suffix}"
+        )
+        temporary = wav.with_suffix(wav.suffix + ".partial")
+        sf.write(temporary, audio, TARGET_SR, subtype="PCM_16", format="WAV")
+        temporary.replace(wav)
+        generation_seconds.append(elapsed)
+        durations.append(duration)
+        audio_stats.append({"rms": rms, "peak": peak})
+        wav_paths.append(wav)
+        peak_vram = max(peak_vram, torch.cuda.max_memory_allocated() / 1024**3)
+
     for handle in handles:
         handle.remove()
     if len(hits) != 196:
         raise RuntimeError(f"Only {len(hits)}/196 AWQ modules executed")
-    if not output.speech_outputs or output.speech_outputs[0] is None:
-        raise RuntimeError("AWQ smoke test produced no audio")
-
-    audio = output.speech_outputs[0].squeeze().float().cpu().numpy()
-    if not np.isfinite(audio).all():
-        raise RuntimeError("AWQ smoke test produced NaN or Inf audio")
-    rms = float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
-    peak = float(np.max(np.abs(audio)))
-    if rms < 1e-5 or peak < 1e-4:
-        raise RuntimeError(f"AWQ smoke test produced silence: RMS={rms}, peak={peak}")
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(args.output, audio, 24000)
-    duration = len(audio) / 24000
-    tts_peak_vram = torch.cuda.max_memory_allocated() / 1024**3
-
-    del model, output
+    del model, generated, inputs, processor
+    gc.collect()
     torch.cuda.empty_cache()
-    asr = whisper.load_model("large-v3", device="cuda")
-    audio_16k = librosa.resample(audio.astype(np.float32), orig_sr=24000, target_sr=16000)
-    transcript = asr.transcribe(
-        audio_16k,
-        language="es",
-        fp16=True,
-        condition_on_previous_text=False,
-        verbose=False,
-    )["text"].strip()
-    wer = float(jiwer.wer(args.text.lower(), transcript.lower()))
-    if wer > args.max_wer:
-        raise RuntimeError(
-            f"AWQ smoke WER {wer:.3f} exceeds {args.max_wer:.3f}: {transcript!r}"
+    asr = whisper.load_model(
+        "large-v3", device="cpu", download_root=str(Path.home() / ".cache" / "whisper")
+    )
+    samples = []
+    for text, wav, stats in zip(TEXTS, wav_paths, audio_stats):
+        audio_16k, _ = librosa.load(wav, sr=16000, mono=True)
+        transcript = asr.transcribe(
+            audio_16k,
+            language="es",
+            fp16=False,
+            verbose=False,
+            condition_on_previous_text=False,
+            temperature=0.0,
+            beam_size=1,
+            sample_len=64,
+        )["text"].strip()
+        samples.append(
+            {
+                "reference": text,
+                "transcript": transcript,
+                "wer": float(jiwer.wer(normalize(text), normalize(transcript))),
+                "cer": float(jiwer.cer(normalize(text), normalize(transcript))),
+                **stats,
+            }
         )
+    del asr
+    wer = float(np.mean([sample["wer"] for sample in samples]))
 
     metrics = {
         "model": str(args.model.resolve()),
@@ -116,22 +176,31 @@ def main():
         "backend": "AutoAWQ GEMM/Triton",
         "load_seconds": load_seconds,
         "generation_seconds": generation_seconds,
-        "audio_seconds": duration,
-        "audio_rms": rms,
-        "audio_peak": peak,
-        "transcript": transcript,
+        "audio_seconds": durations,
         "wer": wer,
-        "rtf": generation_seconds / duration,
-        "vram_peak_gib": tts_peak_vram,
+        "cer": float(np.mean([sample["cer"] for sample in samples])),
+        "max_wer": args.max_wer,
+        "passed": wer <= args.max_wer,
+        "rtf": float(
+            np.mean([elapsed / duration for elapsed, duration in zip(generation_seconds, durations)])
+        ),
+        "vram_peak_gib": peak_vram,
+        "voice": str(VOICE.resolve()),
+        "artifact_fingerprint": artifact_fingerprint,
+        "protocol": PROTOCOL,
+        "samples": samples,
     }
-    metrics_path = args.output.with_suffix(".json")
     atomic_json(metrics_path, metrics)
-    manifest_path = args.model / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["smoke"] = metrics
+    if not metrics["passed"]:
+        manifest["status"] = "quality_failed"
+        atomic_json(manifest_path, manifest)
+        print(json.dumps(metrics, indent=2, ensure_ascii=False))
+        print(f"AWQ rejected: WER {wer:.4f} exceeds {args.max_wer:.4f}")
+        return
     if manifest.get("status") not in {"structure_validated", "validated"}:
         raise RuntimeError(f"Unexpected pre-smoke artifact status: {manifest.get('status')}")
     manifest["status"] = "validated"
-    manifest["smoke"] = metrics
     atomic_json(manifest_path, manifest)
     print(json.dumps(metrics, indent=2))
 

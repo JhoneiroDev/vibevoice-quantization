@@ -61,6 +61,9 @@ def checkpoint_files(path: Path) -> list[Path]:
 
 def source_hashes(path: Path) -> dict[str, str]:
     files = [path / "config.json", *checkpoint_files(path)]
+    index_path = path / "model.safetensors.index.json"
+    if index_path.is_file():
+        files.append(index_path)
     return {file.name: sha256(file) for file in files}
 
 

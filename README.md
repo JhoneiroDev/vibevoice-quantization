@@ -14,11 +14,11 @@ Este proyecto constituye el marco experimental de una tesis que evalua seis tecn
 |--------|---------|--------|
 | **Sprint 1** | Infraestructura de datos y set de calibracion | Completado |
 | **Sprint 1.5** | Primera adaptacion monolingue: LoRA + diffusion head | Completado; gate con voz WER=0.2321 |
-| **Sprint 2** | TorchAO W4A16 HQQ g128 selectivo | Implementado; ejecucion pendiente de autorizacion |
+| **Sprint 2** | TorchAO W4A16 HQQ g128 selectivo | Validado; WER=0.1845, pico=3.55 GiB |
 | **Sprint 2.5** | Analisis de arquitectura y diagnostico de fallos | Completado |
-| **Sprint 3** | GPTQ W4 g128 selectivo con loader hibrido Triton | Implementado; build canonico pendiente |
-| **Sprint 4** | AWQ W4A16 g128 selectivo con AutoAWQ/Triton | Implementado; build canonico pendiente |
-| **Sprint 5** | INT8 selectiva (Fabio Sarracino + HelpfulHand3) | Validado; WER=0.1409, pico=3.99 GiB |
+| **Sprint 3** | GPTQ W4 g128 selectivo con loader hibrido Triton | Rechazado por gate; revision TTS-prefill WER=0.3423 |
+| **Sprint 4** | AWQ W4A16 g128 selectivo con AutoAWQ/Triton | Rechazado por gate; WER=0.3095 |
+| **Sprint 5** | INT8 selectiva (Fabio Sarracino + HelpfulHand3) | Validado; WER=0.1409, pico=5.18 GiB |
 | **Sprint 6** | NF4 + double quant (DevParker/Dubedo + Soniqo) | Rechazado por gate; WER=0.3304 |
 | **Sprint 7** | SmoothQuant W8A8 selectivo sobre Qwen2 | Validado; WER=0.1518, pico=3.96 GiB |
 | **Sprint 8** | 🏁 Benchmark: 7 modelos + validacion estadistica | Pendiente |
@@ -79,7 +79,7 @@ VibeVoice_Optimization/
 │   ├── run_finetune_es.sh               # Fine-tuning monolingue (18h en RTX 4060 Ti)
 │   ├── merge_es_checkpoint.sh           # Merge LoRA + Diffusion Head → VibeVoice-ES
 │   ├── torchao_quantize_vibevoice.py    # Build, recarga y gate TorchAO W4A16
-│   ├── build_vibevoice_gptq.sh           # GPTQ W4 selectivo y persistente
+│   ├── build_vibevoice_gptq_tts.sh       # Revision GPTQ con prefills TTS reales
 │   ├── gptq_vibevoice.py                 # Export, validacion y loader hibrido
 │   ├── smoke_vibevoice_gptq.py           # Recarga limpia y smoke TTS GPTQ
 │   ├── setup_autoawq.sh                   # Preflight AutoAWQ 0.2.9 + Triton
@@ -126,17 +126,19 @@ Sprint 2 usa TorchAO `0.18.0` para convertir solo las 196 proyecciones Qwen a W4
 python scripts/torchao_quantize_vibevoice.py
 ```
 
-Sprint 3 usa GPTQModel en el mismo entorno `vibevoice`. El build guarda por separado el decoder GPTQ y los componentes TTS protegidos; el smoke test siempre recarga ese layout desde cero:
+Sprint 3 usa GPTQModel en el mismo entorno `vibevoice`. La version conservada guarda por separado el decoder GPTQ y los componentes TTS protegidos, y calibra las 196 proyecciones con 256 activaciones reales del prefill TTS (`inputs_embeds`, 32589 tokens) usando `desc_act=True`:
 
 ```bash
 bash scripts/setup_gptqmodel.sh
-bash scripts/build_vibevoice_gptq.sh
+bash scripts/build_vibevoice_gptq_tts.sh
 python scripts/smoke_vibevoice_gptq.py \
-  --model weights/vibevoice-1.5b-es-gptq \
-  --output outputs/sprint3_gptq/smoke-es.wav
+  --model weights/vibevoice-1.5b-es-gptq-tts \
+  --output outputs/sprint3_gptq_tts/smoke-es.wav
 ```
 
-Sprint 4 usa AutoAWQ 0.2.9 en el entorno `vibevoice`. Cuantiza exclusivamente las 196 proyecciones Qwen como W4A16 asimetrico g128 GEMM y conserva el pipeline acustico en FP16. El artefacto se acepta solo despues de la validacion estructural y un smoke TTS en proceso limpio:
+Esta version obtuvo WER `0.3423` y no aprobo el umbral `0.30`. El artefacto GPTQ anterior con calibracion de texto aislado fue eliminado; sus metricas historicas se conservan para trazabilidad.
+
+Sprint 4 usa AutoAWQ 0.2.9 en el entorno `vibevoice`. Cuantiza exclusivamente las 196 proyecciones Qwen como W4A16 asimetrico g128 GEMM y conserva el pipeline acustico en FP16. La calibracion captura 256 prefills TTS reales con la voz fija y los convierte en bloques de 256 tokens para AutoAWQ. El artefacto se acepta solo despues de la validacion estructural y el gate canonico de seis frases, Whisper large-v3 y `WER <= 0.30`:
 
 ```bash
 bash scripts/setup_autoawq.sh
@@ -145,6 +147,8 @@ python scripts/smoke_vibevoice_awq.py \
   --model weights/vibevoice-1.5b-es-awq \
   --output outputs/sprint4_awq/smoke-es.wav
 ```
+
+El candidato actual completo obtuvo WER `0.3095`, CER `0.2352`, RTF `1.3181` y pico `3.39 GiB`; se conserva con estado `quality_failed` porque no alcanza el umbral `0.30`.
 
 ### 3. Pipeline de cuantizacion — Sprints 1 al 7
 
@@ -158,9 +162,9 @@ Las celdas largas desde `S1.5-03` se ejecutan como jobs desacoplados del kernel.
 |--------|--------|-----|-----|
 | Sprint 1 | Datos + calibracion | — | — |
 | Sprint 1.5 | VibeVoice-ES (primer LoRA) | 0.2321 con voice prompt | — |
-| Sprint 2 | TorchAO W4A16 HQQ g128 selectivo | Pendiente | — |
-| Sprint 3 | GPTQ W4 g128 selectivo | Pendiente | — |
-| Sprint 4 | AWQ W4A16 g128 selectivo | Pendiente | — |
+| Sprint 2 | TorchAO W4A16 HQQ g128 selectivo | 0.1845 | — |
+| Sprint 3 | GPTQ W4 g128, revision TTS-prefill | 0.3423 (rechazado) | — |
+| Sprint 4 | AWQ W4A16 g128 selectivo | 0.3095 (rechazado) | — |
 
 **Precaucion:** antes de cualquier import del modelo, aplicar el parche obligatorio de `CONFIG_MAPPING` (colision de nombres en `transformers>=4.45.x`):
 
@@ -177,7 +181,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 - **Flash Attention:** NO instalado. Compilar `flash-attn` desde fuente satura la RAM de WSL2. Se usa PyTorch SDPA nativa con `attn_implementation="sdpa"`.
 - **LoRA de adaptacion linguistica (Sprint 1.5):** Fine-tuning pre-cuantizacion sobre datos en espanol; sus pesos se mergean al modelo base. Es el unico LoRA del proyecto: el LoRA de compensacion post-AWQ (Sprint 4) se descarto porque peft no admite adaptadores sobre las capas `WQLinear` de AutoAWQ.
 - **Dataset:** `fsicoli/common_voice_17_0` (config `"es"`), mirror comunitario del dataset original de Mozilla (retirado Oct 2025). Audio original a 48kHz → remuestreo a 24kHz + normalizacion a -25 dB FS.
-- **Set de calibracion:** 512 muestras reservadas del split `validation`. GPTQ y AWQ consumen sus transcripciones auditadas desde `data/calibration_metadata.json`; `data/calibration_tensor.pt` conserva el audio preprocesado para tecnicas que requieran activaciones acusticas.
+- **Set de calibracion:** 512 muestras reservadas del split `validation`. GPTQ y AWQ seleccionan 256 registros y capturan `inputs_embeds` de prefills TTS reales con voz condicionada; `data/calibration_tensor.pt` conserva el audio preprocesado para otras tecnicas.
 - **Cuantizabilidad:** Arquitectura confirmada compatible con GPTQ/AWQ. Todas las capas proyectivas son `nn.Linear` estandar. Los tokenizers convolucionales (~35% params) se preservan en FP16. VRAM esperada post-cuantizacion: ~2.5-3.5 GB.
 - **TorchAO preserva la inferencia oficial:** Sprint 2 usa `TorchAoConfig` y `Int4WeightOnlyConfig` con HQQ g128. El manifiesto exige exactamente 196 pesos `Int4TilePackedTo4dTensor`, recarga limpia y gate con voz.
 - **GGUF/CrispASR fue descartado:** tanto F16 como IQ4_NL fallaron en la ruta C++ con voz condicionada, mientras que la inferencia oficial de PyTorch funciona con el checkpoint canonico.
@@ -194,10 +198,10 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 | Variante | Tecnica | Libreria | Resultados |
 |---|---|---|---|
 | **FP16** ($O_1$) | Linea base sin compresion | — | 5.04 GB VRAM, RTF=1.35, WER=0.54 |
-| **TorchAO W4A16** ($X_1$) | HQQ g128 selectivo, Qwen-only | TorchAO/PyTorch CUDA | Implementado; ejecucion pendiente |
-| **GPTQ** ($X_2$) | Reconstruccion Hessiana W4 g128, Qwen-only | GPTQModel/Triton | Implementado; benchmark corregido pendiente |
-| **AWQ** ($X_3$) | Proteccion de canales W4A16 g128, Qwen-only | AutoAWQ/Triton | Implementado; benchmark corregido pendiente |
-| **INT8** | Selectiva LLM-only | bitsandbytes | Validado; WER=0.1409, pico=3.99 GiB |
+| **TorchAO W4A16** ($X_1$) | HQQ g128 selectivo, Qwen-only | TorchAO/PyTorch CUDA | Validado; WER=0.1845, pico=3.55 GiB |
+| **GPTQ** ($X_2$) | Reconstruccion Hessiana W4 g128, Qwen-only | GPTQModel/Triton | Rechazado; revision TTS-prefill WER=0.3423 |
+| **AWQ** ($X_3$) | Proteccion de canales W4A16 g128, Qwen-only | AutoAWQ/Triton | Rechazado; WER=0.3095 |
+| **INT8** | Selectiva LLM-only | bitsandbytes | Validado; WER=0.1409, pico=5.18 GiB, RTF=2.3380 |
 | **NF4** | NormalFloat4 + double quant selectivo | bitsandbytes | Rechazado; WER=0.3304 |
 | **SmoothQuant** | W8A8 selectivo, salida BF16 | `torch._int_mm` | Validado; 3.83 GiB idle, 3.96 GiB pico, WER=0.1518 |
 
@@ -206,11 +210,11 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 | Modelo | VRAM (GB) | RTF | WER | CER | PPL |
 |--------|-----------|-----|-----|-----|-----|
 | FP16 | 5.04 | 1.35 | 0.5385 | 0.3134 | — |
-| TorchAO W4A16 | Pendiente | Pendiente | Pendiente | Pendiente | — |
-| GPTQ W4 g128 | Pendiente | Pendiente | Pendiente | Pendiente | — |
-| AWQ | Pendiente | Pendiente | Pendiente | Pendiente | — |
-| INT8 | Pendiente | Pendiente | Pendiente | Pendiente | — |
-| NF4 | Pendiente | Pendiente | Pendiente | Pendiente | — |
+| TorchAO W4A16 | 3.55 | 1.0978 | 0.1845 | 0.1019 | — |
+| GPTQ W4 g128 TTS-prefill | 3.37 | 1.1948 | 0.3423 | 0.1783 | — |
+| AWQ W4A16 g128 | 3.39 | 1.3181 | 0.3095 | 0.2352 | — |
+| INT8 | 5.18 | 2.3380 | 0.1409 | 0.1118 | — |
+| NF4 W4A16 double quant | 4.01 | 1.3215 | 0.3304 | 0.2056 | — |
 | SmoothQuant W8A8 | 3.96 | 1.5632 | 0.1518 | 0.0884 | — |
 
 ## Metricas de Evaluacion

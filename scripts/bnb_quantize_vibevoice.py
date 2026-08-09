@@ -70,6 +70,48 @@ SENSITIVE_MODULES = [
     "acoustic_connector",
     "semantic_connector",
 ]
+EXPECTED_QUANTIZED_MODULES = len(expected_qwen_weights())
+
+
+def _validate_protected_modules(model, mode: str) -> None:
+    language_model = model.model.language_model
+    for name in SENSITIVE_MODULES:
+        module = getattr(language_model, name, None) if name in {"embed_tokens", "lm_head"} else None
+        if name == "embed_tokens":
+            module = language_model.embed_tokens
+        elif name == "lm_head":
+            module = model.lm_head
+        else:
+            module = getattr(model.model, name, None)
+        if module is None:
+            continue
+        if isinstance(module, (Linear4bit, Linear8bitLt)):
+            raise AssertionError(f"Protected module was quantized: {name}")
+        for parameter in module.parameters():
+            if parameter.is_floating_point() and parameter.dtype not in {
+                torch.float16,
+                torch.bfloat16,
+            }:
+                raise AssertionError(
+                    f"Protected {mode.upper()} module has unsupported dtype: {name}={parameter.dtype}"
+                )
+
+
+def _validate_nf4_state(module, name: str) -> None:
+    state = module.weight.quant_state
+    if state is None or not state.nested:
+        raise AssertionError(f"Missing NF4 double-quant state: {name}")
+    if state.quant_type != "nf4":
+        raise AssertionError(f"Unexpected NF4 quant type for {name}: {state.quant_type}")
+    if state.blocksize != 64 or module.weight.dtype != torch.uint8:
+        raise AssertionError(
+            f"Unexpected NF4 storage for {name}: dtype={module.weight.dtype}, blocksize={state.blocksize}"
+        )
+    if not torch.isfinite(state.absmax.float()).all():
+        raise AssertionError(f"Non-finite NF4 scales: {name}")
+    nested = state.state2
+    if nested is None or not torch.isfinite(nested.absmax.float()).all():
+        raise AssertionError(f"Missing or non-finite double-quant scales: {name}")
 
 
 def _configuration(mode: str) -> tuple[BitsAndBytesConfig, type, torch.dtype]:
@@ -127,16 +169,15 @@ def _validate_modules(model, module_type: type, mode: str) -> list[str]:
 
     for name, module in modules.items():
         if mode == "nf4":
-            state = module.weight.quant_state
-            if state is None or not state.nested or module.compute_dtype != torch.bfloat16:
-                raise AssertionError(f"Invalid NF4/Double Quant state: {name}")
-            if not torch.isfinite(state.absmax.float()).all():
-                raise AssertionError(f"Non-finite NF4 scales: {name}")
+            if module.compute_dtype != torch.bfloat16:
+                raise AssertionError(f"NF4 compute dtype is not BF16: {name}")
+            _validate_nf4_state(module, name)
         else:
             scale = getattr(module.weight, "SCB", None)
             if scale is not None and not torch.isfinite(scale.float()).all():
                 raise AssertionError(f"Non-finite INT8 scales: {name}")
 
+    _validate_protected_modules(model, mode)
     embedding = model.model.language_model.embed_tokens.weight
     if embedding.dtype not in {torch.float16, torch.bfloat16}:
         raise AssertionError(f"embed_tokens has unexpected dtype: {embedding.dtype}")
@@ -159,13 +200,13 @@ def _validate_existing(path: Path, mode: str) -> dict:
     if manifest.get("schema") != "vibevoice-selective-bnb-v1":
         raise ValueError(f"Unsupported bitsandbytes artifact: {path}")
     validate_manifest_source(manifest)
-    if manifest.get("status") != "validated":
+    if manifest.get("status") not in {"validated", "quality_failed"}:
         raise ValueError(f"Artifact is not validated: {manifest.get('status')}")
     if manifest.get("quantization", {}).get("type") != mode:
         raise ValueError(f"Artifact mode does not match {mode}: {path}")
     if manifest.get("artifacts") != _artifact_inventory(path):
         raise ValueError(f"Artifact hashes do not match manifest: {path}")
-    if manifest.get("validation", {}).get("quantized_modules") != 196:
+    if manifest.get("validation", {}).get("quantized_modules") != EXPECTED_QUANTIZED_MODULES:
         raise ValueError(f"Artifact does not contain 196 validated modules: {path}")
     return manifest
 
@@ -237,6 +278,9 @@ def run(mode: str) -> None:
     reloaded_names = _validate_modules(reloaded, module_type, mode)
     if reloaded_names != names:
         raise AssertionError(f"{mode.upper()} target set changed after reload")
+    _validate_protected_modules(reloaded, mode)
+    if reloaded.lm_head.weight.data_ptr() != reloaded.model.language_model.embed_tokens.weight.data_ptr():
+        raise AssertionError("lm_head and embed_tokens are not tied after reload")
 
     idle_vram = torch.cuda.memory_allocated() / 1024**3
     peak_vram = idle_vram
@@ -320,6 +364,8 @@ def run(mode: str) -> None:
         "source": str(SOURCE.resolve()),
         "source_hashes": source_hashes(SOURCE),
         "source_gate_wer": gate["wer"],
+        "voice": str(VOICE.resolve()),
+        "protocol": "six-texts-en-Alice-large-v3-WER-0.30-v1",
         "quantization": mode,
         "quantized_modules": len(names),
         "quantized_parameter_fraction": quantized_params / total_params,
@@ -340,9 +386,11 @@ def run(mode: str) -> None:
         "source_hashes": source_hashes(SOURCE),
         "quantization": {
             "type": mode,
-            "expected_modules": 196,
+            "expected_modules": EXPECTED_QUANTIZED_MODULES,
             "double_quant": mode == "nf4",
             "compute_dtype": str(model_dtype),
+            "protected_dtype": "torch.float16_or_bfloat16_native",
+            "tied_weights_verified": True,
         },
         "artifacts": _artifact_inventory(partial),
         "validation": {

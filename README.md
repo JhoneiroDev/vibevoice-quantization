@@ -23,7 +23,7 @@ Este proyecto constituye el marco experimental de una tesis que evalua seis tecn
 | **Sprint 7** | SmoothQuant W8A8 selectivo sobre Qwen2 | Validado; WER=0.0685, pico=3.96 GiB |
 | **Sprint 8** | 🏁 Benchmark: 7 modelos + validacion estadistica | Completado; resultados en `outputs/sprint8_benchmark/` |
 
-Ver [`docs/quantization_architecture_analysis.md`](docs/quantization_architecture_analysis.md) para el analisis completo de la arquitectura, compatibilidad con GPTQ/AWQ, y diagnostico de fallos previos.
+Ver `docs/quantization_architecture_analysis.md` (excluido del repo, solo local) para el analisis completo de la arquitectura, compatibilidad con GPTQ/AWQ, y diagnostico de fallos previos.
 
 ## Arquitectura del Modelo
 
@@ -86,7 +86,7 @@ VibeVoice_Optimization/
 │   ├── build_vibevoice_awq.sh             # AWQ W4A16 selectivo y persistente
 │   ├── awq_vibevoice.py                   # Export, validacion y loader hibrido
 │   └── smoke_vibevoice_awq.py             # Recarga limpia, TTS y gate WER AWQ
-├── VibeVoice_repo/                      # Codigo fuente del fork comunitario
+├── VibeVoice_repo/                      # (gitignored) Codigo fuente del fork comunitario
 │   ├── vibevoice/modular/               # Definicion de arquitectura (.py)
 │   ├── vibevoice/finetune/              # Scripts de entrenamiento
 │   ├── vibevoice/processor/             # Procesadores de audio y tokenizadores

@@ -161,10 +161,10 @@ Las celdas largas desde `S1.5-03` se ejecutan como jobs desacoplados del kernel.
 | Sprint | Modelo | WER | PPL |
 |--------|--------|-----|-----|
 | Sprint 1 | Datos + calibracion | — | — |
-| Sprint 1.5 | VibeVoice-ES (primer LoRA) | 0.2321 con voice prompt | — |
-| Sprint 2 | TorchAO W4A16 HQQ g128 selectivo | 0.1845 | — |
-| Sprint 3 | GPTQ W4 g128, revision TTS-prefill | 0.3423 (rechazado) | — |
-| Sprint 4 | AWQ W4A16 g128 selectivo | 0.3095 (rechazado) | — |
+| Sprint 1.5 | VibeVoice-ES (primer LoRA) | 0.2321 con voice prompt | 1.0604 |
+| Sprint 2 | TorchAO W4A16 HQQ g128 selectivo | 0.1845 | 1.0770 |
+| Sprint 3 | GPTQ W4 g128, revision TTS-prefill | 0.3423 (rechazado) | 1.0792 |
+| Sprint 4 | AWQ W4A16 g128 selectivo | 0.3571 (rechazado) | 1.0671 |
 
 **Precaucion:** antes de cualquier import del modelo, aplicar el parche obligatorio de `CONFIG_MAPPING` (colision de nombres en `transformers>=4.45.x`):
 
@@ -197,25 +197,25 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 
 | Variante | Tecnica | Libreria | Resultados |
 |---|---|---|---|
-| **FP16** ($O_1$) | Linea base sin compresion | — | 5.04 GB VRAM, RTF=1.35, WER=0.54 |
+| **FP16** ($O_1$) | Linea base sin compresion | — | 5.18 GiB VRAM, RTF=0.9475, WER=0.2321 |
 | **TorchAO W4A16** ($X_1$) | HQQ g128 selectivo, Qwen-only | TorchAO/PyTorch CUDA | Validado; WER=0.1845, pico=3.55 GiB |
 | **GPTQ** ($X_2$) | Reconstruccion Hessiana W4 g128, Qwen-only | GPTQModel/Triton | Rechazado; revision TTS-prefill WER=0.3423 |
-| **AWQ** ($X_3$) | Proteccion de canales W4A16 g128, Qwen-only | AutoAWQ/Triton | Rechazado; WER=0.3095 |
-| **INT8** | Selectiva LLM-only | bitsandbytes | Validado; WER=0.1409, pico=5.18 GiB, RTF=2.3380 |
-| **NF4** | NormalFloat4 + double quant selectivo | bitsandbytes | Rechazado; WER=0.3304 |
-| **SmoothQuant** | W8A8 selectivo, salida BF16 | `torch._int_mm` | Validado; 3.83 GiB idle, 3.96 GiB pico, WER=0.0685 |
+| **AWQ** ($X_3$) | Proteccion de canales W4A16 g128, Qwen-only | AutoAWQ/Triton | Rechazado; WER=0.3571 |
+| **INT8** | Selectiva LLM-only | bitsandbytes | Validado; WER=0.2083, pico=3.98 GiB, RTF=2.3694 |
+| **NF4** | NormalFloat4 + double quant selectivo | bitsandbytes | Rechazado; WER=0.3095 |
+| **SmoothQuant** | W8A8 selectivo, salida BF16 | `torch._int_mm` | Validado; 3.89 GiB idle, 4.04 GiB pico, WER=0.0685 |
 
 ### Tabla Comparativa Final (Sprint 8 — Benchmark)
 
-| Modelo | VRAM (GB) | RTF | WER | CER | PPL |
+| Modelo | VRAM (GB) | RTF | WER | CER | PPL control |
 |--------|-----------|-----|-----|-----|-----|
-| FP16 | 5.04 | 1.35 | 0.5385 | 0.3134 | — |
-| TorchAO W4A16 | 3.55 | 1.0978 | 0.1845 | 0.1019 | — |
-| GPTQ W4 g128 TTS-prefill | 3.37 | 1.1948 | 0.3423 | 0.1783 | — |
-| AWQ W4A16 g128 | 3.39 | 1.3181 | 0.3095 | 0.2352 | — |
-| INT8 | 5.18 | 2.3380 | 0.1409 | 0.1118 | — |
-| NF4 W4A16 double quant | 4.01 | 1.3215 | 0.3304 | 0.2056 | — |
-| SmoothQuant W8A8 | 4.04 | 1.5988 | 0.0685 | 0.0419 | — |
+| FP16 | 5.18 | 0.9475 | 0.2321 | 0.1546 | 1.0604 |
+| TorchAO W4A16 | 3.55 | 1.0133 | 0.1845 | 0.1019 | 1.0770 |
+| GPTQ W4 g128 TTS-prefill | 3.37 | 1.1517 | 0.3423 | 0.1783 | 1.0792 |
+| AWQ W4A16 g128 | 3.39 | 1.2743 | 0.3571 | 0.2544 | 1.0671 |
+| INT8 | 3.98 | 2.3694 | 0.2083 | 0.1505 | 1.0618 |
+| NF4 W4A16 double quant | 3.37 | 1.1507 | 0.3095 | 0.1880 | 1.0761 |
+| SmoothQuant W8A8 | 4.04 | 1.5988 | 0.0685 | 0.0419 | 1.0634 |
 
 ## Metricas de Evaluacion
 
@@ -228,7 +228,7 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 ### Preservacion de Calidad
 - Word Error Rate (WER) — via Whisper large-v3
 - Character Error Rate (CER) — distancia de Levenshtein via JiWER
-- Perplejidad del modelo (PPL) — CrossEntropyLoss, escala Yao et al. (Clase-1 $\le 0.1$, Clase-2 $\le 0.5$, Clase-3 $> 0.5$)
+- Perplejidad de tokens de control acustico (PPL) — `exp(sum(CrossEntropyLoss) / tokens)`, con teacher forcing sobre 100 audios held-out
 
 ### Validacion Estadistica (Sprint 5)
 - Prueba de normalidad: Shapiro-Wilk
@@ -238,24 +238,40 @@ if hasattr(transformers, "CONFIG_MAPPING"):
 
 El benchmark reproducible se ejecuta con `scripts/sprint8_benchmark.py`. Cada variante se recarga en un proceso independiente usando seis textos fijos, la voz `en-Alice_woman.wav` y Whisper large-v3. Los resultados completos, muestras individuales, IC95 bootstrap, CSV y tabla Markdown estan en `outputs/sprint8_benchmark/`.
 
-| Modelo | Estado | VRAM pico (GiB) | RTF | WER | CER |
-|---|---|---:|---:|---:|---:|
-| FP16 | baseline | 5.18 | 0.9475 | 0.2321 | 0.1546 |
-| TorchAO INT4 | validado | 3.55 | 1.0133 | 0.1845 | 0.1019 |
-| GPTQ TTS | rechazado | 3.37 | 1.1517 | 0.3423 | 0.1783 |
-| AWQ | rechazado | 3.39 | 1.2743 | 0.3571 | 0.2544 |
-| NF4 | rechazado | 3.37 | 1.1507 | 0.3095 | 0.1880 |
-| INT8 | validado | 3.98 | 2.3694 | 0.2083 | 0.1505 |
-| SmoothQuant | validado | 4.04 | 1.5988 | 0.0685 | 0.0419 |
+| Modelo | Estado | VRAM pico (GiB) | RTF | WER | CER | PPL control |
+|---|---|---:|---:|---:|---:|---:|
+| FP16 | baseline | 5.18 | 0.9475 | 0.2321 | 0.1546 | 1.0604 |
+| TorchAO INT4 | validado | 3.55 | 1.0133 | 0.1845 | 0.1019 | 1.0770 |
+| GPTQ TTS | rechazado | 3.37 | 1.1517 | 0.3423 | 0.1783 | 1.0792 |
+| AWQ | rechazado | 3.39 | 1.2743 | 0.3571 | 0.2544 | 1.0671 |
+| NF4 | rechazado | 3.37 | 1.1507 | 0.3095 | 0.1880 | 1.0761 |
+| INT8 | validado | 3.98 | 2.3694 | 0.2083 | 0.1505 | 1.0618 |
+| SmoothQuant | validado | 4.04 | 1.5988 | 0.0685 | 0.0419 | 1.0634 |
 
 PESQ y MCD no se calculan porque el protocolo actual no contiene ondas de referencia emparejadas para los seis textos; se reportan todas las metricas validables sin inventar valores.
-`summary.json` incluye comparaciones pareadas contra FP16 mediante Shapiro-Wilk y Wilcoxon. Estas pruebas son exploratorias (`n=6`) y no sustituyen el benchmark estadistico ampliado del split `test`.
+`summary.json` incluye comparaciones pareadas contra FP16 mediante Shapiro-Wilk y Wilcoxon. Estas pruebas son exploratorias (`n=6`) y no sustituyen el benchmark estadistico ampliado. La PPL usa 100 registros del split `validation`, excluye los 512 registros de calibracion y se genera con `scripts/sprint8_perplexity.py`.
+
+### Benchmark Ampliado (n=100)
+
+La corrida ampliada termino correctamente en 3 h 10 min 41 s. Proceso 100 frases held-out por modelo, para un total de 700 sintesis y 700 transcripciones Whisper. Los resultados estan en `outputs/sprint8_benchmark_n100/`.
+
+| Modelo | VRAM pico GiB | RTF | WER | CER | PPL control | Gate 0.30 |
+|---|---:|---:|---:|---:|---:|---|
+| SmoothQuant | 4.04 | 1.4541 | 0.3625 | 0.2283 | 1.0634 | No |
+| INT8 | 3.98 | 2.1994 | 0.3651 | 0.2244 | 1.0618 | No |
+| FP16 | 5.18 | 0.8027 | 0.3937 | 0.2599 | 1.0604 | No |
+| NF4 | 3.37 | 1.0453 | 0.4083 | 0.2543 | 1.0761 | No |
+| GPTQ TTS | 3.37 | 1.0491 | 0.4160 | 0.2412 | 1.0792 | No |
+| AWQ | 3.39 | 0.9910 | 0.5054 | 0.3255 | 1.0671 | No |
+| TorchAO INT4 | 3.55 | 0.9232 | 0.5187 | 0.3118 | 1.0770 | No |
+
+SmoothQuant e INT8 obtuvieron menor WER medio que FP16, pero sin superioridad significativa: Wilcoxon unilateral `p=0.3182` y `p=0.2615`, respectivamente. TorchAO fue significativamente peor que FP16 (`p=0.00353` unilateral; `p=0.00706` bilateral). Por tanto, no se afirma significancia favorable cuando los datos no la sustentan.
 
 ## Hardware de Desarrollo
 
 - **CPU:** Intel Core i5-14400F (8 hilos asignados a WSL2)
 - **GPU:** NVIDIA GeForce RTX 4060 Ti 8GB VRAM (Ada Lovelace, Tensor Cores 4ta Gen)
-- **RAM:** 32GB DDR5 (16-24GB asignados a WSL2 via `.wslconfig`)
+- **RAM:** 32GB DDR5 (16GB asignados a WSL2 via `.wslconfig`)
 - **OS:** Ubuntu 24.04 LTS sobre WSL2 (Windows 11 Host), sistema de archivos EXT4 nativo
 - **IDE:** VS Code con tunel WSL nativo
 - **Entorno:** Micromamba env `vibevoice` (Python 3.12, CUDA 13.0)

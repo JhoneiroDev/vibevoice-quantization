@@ -112,7 +112,31 @@ def bootstrap_ci(values: list[float], seed: int = 42, samples: int = 2000) -> li
     return [float(np.quantile(draws, 0.025)), float(np.quantile(draws, 0.975))]
 
 
-def run_worker(model_id: str) -> dict:
+def load_text_selection(path: Path | None) -> list[str]:
+    if path is None:
+        return list(TEXTS)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    records = payload.get("records", payload) if isinstance(payload, dict) else payload
+    texts = [record["sentence"] if isinstance(record, dict) else str(record) for record in records]
+    texts = [text.strip() for text in texts if text.strip()]
+    if not texts:
+        raise ValueError(f"No benchmark sentences in {path}")
+    return texts
+
+
+def protocol_for(text_file: Path | None, count: int) -> str:
+    if text_file is None:
+        return PROTOCOL
+    return f"common-voice-17-es-validation-heldout-n{count}-Alice-large-v3-WER-0.30-v1"
+
+
+def run_worker(
+    model_id: str,
+    texts: list[str] | None = None,
+    output: Path = OUTPUT,
+    protocol: str = PROTOCOL,
+) -> dict:
+    texts = list(TEXTS) if texts is None else texts
     path, kind = MODELS[model_id]
     if not path.is_dir():
         raise FileNotFoundError(f"Missing benchmark artifact: {path}")
@@ -128,9 +152,9 @@ def run_worker(model_id: str) -> dict:
     idle_vram = torch.cuda.memory_allocated() / 1024**3
     generation_seconds, audio_seconds, audio_paths = [], [], []
     sample_stats = []
-    model_output = OUTPUT / model_id
+    model_output = output / model_id
     model_output.mkdir(parents=True, exist_ok=True)
-    for index, text in enumerate(TEXTS, start=1):
+    for index, text in enumerate(texts, start=1):
         torch.manual_seed(42 + index - 1)
         inputs = processor(
             text=[f"Speaker 1: {text}"], voice_samples=[[str(VOICE)],],
@@ -171,7 +195,7 @@ def run_worker(model_id: str) -> dict:
     torch.cuda.empty_cache()
     asr = whisper.load_model("large-v3", device="cpu", download_root=str(Path.home() / ".cache" / "whisper"))
     samples = []
-    for text, wav, stats in zip(TEXTS, audio_paths, sample_stats):
+    for text, wav, stats in zip(texts, audio_paths, sample_stats):
         audio, _ = librosa.load(wav, sr=16000, mono=True)
         transcript = asr.transcribe(
             audio, language="es", fp16=False, verbose=False,
@@ -195,24 +219,25 @@ def run_worker(model_id: str) -> dict:
         "audio_seconds": audio_seconds, "rtf": float(np.mean(rtfs)),
         "rtf_std": float(np.std(rtfs, ddof=1)), "wer": float(np.mean(wers)),
         "cer": float(np.mean(cers)), "corpus_wer": float(jiwer.wer(
-            " ".join(normalize(text) for text in TEXTS),
+            " ".join(normalize(text) for text in texts),
             " ".join(normalize(sample["transcript"]) for sample in samples),
         )),
         "wer_ci95": bootstrap_ci(wers), "cer_ci95": bootstrap_ci(cers),
         "rtf_ci95": bootstrap_ci(rtfs), "max_wer": MAX_WER,
         "passed": float(np.mean(wers)) <= MAX_WER,
-        "protocol": PROTOCOL, "voice": str(VOICE.resolve()),
+        "protocol": protocol, "text_count": len(texts), "voice": str(VOICE.resolve()),
         "samples": samples,
     }
     return result
 
 
-def write_reports(results: list[dict]) -> None:
-    OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+def write_reports(results: list[dict], output: Path = OUTPUT, protocol: str = PROTOCOL) -> None:
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     successful = [result for result in results if "error" not in result]
+    with_ppl = [result for result in successful if result.get("perplexity") is not None]
     summary = {
-        "protocol": PROTOCOL,
+        "protocol": protocol,
         "models_total": len(results),
         "models_completed": len(successful),
         "models_passed": sum(bool(result.get("passed")) for result in successful),
@@ -223,9 +248,13 @@ def write_reports(results: list[dict]) -> None:
         "best_wer": min(successful, key=lambda item: item["wer"])["model_id"] if successful else None,
         "best_rtf": min(successful, key=lambda item: item["rtf"])["model_id"] if successful else None,
         "best_vram": min(successful, key=lambda item: item["vram_peak_gib"])["model_id"] if successful else None,
+        "ppl_ranking": [
+            result["model_id"] for result in sorted(with_ppl, key=lambda item: item["perplexity"])
+        ],
+        "best_ppl": min(with_ppl, key=lambda item: item["perplexity"])["model_id"] if with_ppl else None,
         "unavailable_metrics": {
-            "pesq": "Not computed: no paired reference waveform exists for the six canonical texts.",
-            "mcd": "Not computed: no paired reference waveform exists for the six canonical texts.",
+            "pesq": "Not computed: no paired reference waveform exists for the benchmark texts.",
+            "mcd": "Not computed: no paired reference waveform exists for the benchmark texts.",
         },
     }
     baseline = next((result for result in successful if result["model_id"] == "fp16"), None)
@@ -242,11 +271,15 @@ def write_reports(results: list[dict]) -> None:
                 baseline_wers = [sample["wer"] for sample in baseline["samples"]]
                 model_wers = [sample["wer"] for sample in result["samples"]]
                 differences = np.asarray(model_wers) - np.asarray(baseline_wers)
-                try:
-                    wilcoxon_result = wilcoxon(differences, alternative="less", zero_method="wilcox")
-                    wilcoxon_p = float(wilcoxon_result.pvalue)
-                except ValueError:
-                    wilcoxon_p = None
+                wilcoxon_p = {}
+                for alternative in ("less", "greater", "two-sided"):
+                    try:
+                        wilcoxon_result = wilcoxon(
+                            differences, alternative=alternative, zero_method="wilcox"
+                        )
+                        wilcoxon_p[alternative] = float(wilcoxon_result.pvalue)
+                    except ValueError:
+                        wilcoxon_p[alternative] = None
                 try:
                     shapiro_p = float(shapiro(differences).pvalue)
                 except ValueError:
@@ -255,24 +288,27 @@ def write_reports(results: list[dict]) -> None:
                     "baseline": "fp16",
                     "mean_wer_difference_vs_fp16": float(np.mean(differences)),
                     "shapiro_p_difference": shapiro_p,
-                    "wilcoxon_p_model_better": wilcoxon_p,
+                    "wilcoxon_p_model_better": wilcoxon_p["less"],
+                    "wilcoxon_p_model_worse": wilcoxon_p["greater"],
+                    "wilcoxon_p_two_sided": wilcoxon_p["two-sided"],
                     "n_pairs": len(differences),
                 }
     summary["paired_statistics_vs_fp16"] = comparisons
-    (OUTPUT / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    (output / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     fields = ["model_id", "kind", "artifact_status", "artifact_gib", "load_seconds", "vram_idle_gib",
-              "vram_peak_gib", "rtf", "rtf_std", "wer", "cer", "corpus_wer", "passed"]
-    with (OUTPUT / "results.csv").open("w", newline="", encoding="utf-8") as stream:
+              "vram_peak_gib", "rtf", "rtf_std", "wer", "cer", "corpus_wer", "perplexity", "passed"]
+    with (output / "results.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         writer.writerows({field: result.get(field) for field in fields} for result in results)
-    lines = ["# Sprint 8: Benchmark Final", "", f"Protocol: `{PROTOCOL}`", "", "| Modelo | Estado | Disco GiB | VRAM pico | RTF | WER | CER | Pasa |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
+    lines = ["# Sprint 8: Benchmark Final", "", f"Protocol: `{protocol}`", "", "| Modelo | Estado | Disco GiB | VRAM pico | RTF | WER | CER | PPL control | Pasa |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for result in results:
         if "error" in result:
-            lines.append(f"| {result['model_id']} | ERROR | — | — | — | — | — | No |")
+            lines.append(f"| {result['model_id']} | ERROR | — | — | — | — | — | — | No |")
             continue
-        lines.append(f"| {result['model_id']} | {result['artifact_status']} | {result['artifact_gib']:.2f} | {result['vram_peak_gib']:.2f} | {result['rtf']:.4f} | {result['wer']:.4f} | {result['cer']:.4f} | {'Sí' if result['passed'] else 'No'} |")
-    (OUTPUT / "comparison.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        ppl = f"{result['perplexity']:.4f}" if result.get("perplexity") is not None else "N/D"
+        lines.append(f"| {result['model_id']} | {result['artifact_status']} | {result['artifact_gib']:.2f} | {result['vram_peak_gib']:.2f} | {result['rtf']:.4f} | {result['wer']:.4f} | {result['cer']:.4f} | {ppl} | {'Sí' if result['passed'] else 'No'} |")
+    (output / "comparison.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main() -> None:
@@ -280,15 +316,28 @@ def main() -> None:
     parser.add_argument("--worker", choices=sorted(MODELS))
     parser.add_argument("--models", nargs="*", choices=sorted(MODELS), default=sorted(MODELS))
     parser.add_argument("--append", action="store_true", help="Merge selected results with an existing report")
+    parser.add_argument("--text-file", type=Path, help="JSON list or selection object with sentence records")
+    parser.add_argument("--output", type=Path, default=OUTPUT)
     args = parser.parse_args()
+    texts = load_text_selection(args.text_file)
+    protocol = protocol_for(args.text_file, len(texts))
+    output = args.output.resolve()
     if args.worker:
-        print(json.dumps(run_worker(args.worker), ensure_ascii=False))
+        print(json.dumps(run_worker(args.worker, texts, output, protocol), ensure_ascii=False))
         return
     results = []
     for model_id in args.models:
         started = time.perf_counter()
         process = subprocess.run(
-            [sys.executable, __file__, "--worker", model_id],
+            [
+                sys.executable,
+                __file__,
+                "--worker",
+                model_id,
+                "--output",
+                str(output),
+                *(["--text-file", str(args.text_file.resolve())] if args.text_file else []),
+            ],
             cwd=ROOT, capture_output=True, text=True,
         )
         if process.returncode != 0:
@@ -299,13 +348,13 @@ def main() -> None:
         result["worker_wall_seconds"] = time.perf_counter() - started
         results.append(result)
         print(f"{model_id}: WER={result['wer']:.4f}, RTF={result['rtf']:.4f}, VRAM={result['vram_peak_gib']:.2f} GiB")
-    if args.append and (OUTPUT / "results.json").is_file():
-        previous = json.loads((OUTPUT / "results.json").read_text(encoding="utf-8"))
+    if args.append and (output / "results.json").is_file():
+        previous = json.loads((output / "results.json").read_text(encoding="utf-8"))
         selected = set(args.models)
         results = [result for result in previous if result.get("model_id") not in selected] + results
         results.sort(key=lambda result: result.get("model_id", ""))
-    write_reports(results)
-    print(f"Benchmark written to {OUTPUT}")
+    write_reports(results, output, protocol)
+    print(f"Benchmark written to {output}")
 
 
 if __name__ == "__main__":

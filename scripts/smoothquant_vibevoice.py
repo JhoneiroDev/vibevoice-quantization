@@ -88,7 +88,7 @@ class SmoothQuantLinear(nn.Module):
         if qactivation.device.type == "cuda" and hasattr(torch, "_int_mm"):
             # cuBLAS INT8 requires aligned sequence dimensions on this GPU.
             rows = qactivation.shape[0]
-            padded_rows = max(32, (rows + 7) // 8 * 8)
+            padded_rows = max(32, (rows + 31) // 32 * 32)
             if padded_rows != rows:
                 qactivation = torch.nn.functional.pad(qactivation, (0, 0, 0, padded_rows - rows))
             product = torch._int_mm(qactivation, self.qweight.t().contiguous()).float()[:rows]

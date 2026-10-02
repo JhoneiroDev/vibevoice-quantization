@@ -5,6 +5,21 @@ weights/
 data/
 outputs/
 
+# Generated audio samples (experiment runs, TTS outputs)
+capitulo_vi_ejecuciones/
+*.wav
+
+# Third-party vendored repository (Microsoft VibeVoice, keep locally only)
+VibeVoice_repo/
+
+# Scratch/dev directory
+dev/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
 # Project documentation (internal planning/logs)
 agents.md
 backlog_quantization.md
@@ -45,5 +60,6 @@ Thumbs.db
 
 # Logs and checkpoints
 *.log
+logs/
 checkpoints/
 wandb/
